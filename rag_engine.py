@@ -1,0 +1,760 @@
+import networkx as nx
+import numpy as np
+import re
+from typing import List, Dict, Any
+from dataclasses import dataclass, field
+from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+
+
+@dataclass
+class RetrievalResult:
+    context_docs: List[Document] = field(default_factory=list)
+    confidence_score: float = 0.0
+    vector_scores: List[float] = field(default_factory=list)
+    graph_expanded_count: int = 0
+    unique_sources: int = 0
+    avg_graph_centrality: float = 0.0
+    query_alignment_score: float = 0.0
+    top_match_score: float = 0.0
+    answer_evidence_score: float = 0.0
+
+
+@dataclass
+class ComparisonResult:
+    with_graph: RetrievalResult = field(default_factory=RetrievalResult)
+    without_graph: RetrievalResult = field(default_factory=RetrievalResult)
+    answer_with_graph: str = ""
+    answer_without_graph: str = ""
+
+
+class ProvenanceGraphRAG:
+
+    def __init__(self, model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+
+        print(f"Loading local LLM model: {model_name} ...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+
+        pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=220,
+            truncation=True,
+            repetition_penalty=1.1,
+            do_sample=False,
+        )
+
+        self.llm = HuggingFacePipeline(pipeline=pipe)
+
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+        )
+        self.vector_store = None
+        self.graph = nx.Graph()
+        self.documents: List[Document] = []
+        self.max_context_docs = 8
+        self.max_graph_expansion = 5
+        self.rerank_pool_size = 12
+        self.min_graph_edge_weight = 0.6
+
+    @staticmethod
+    def _distance_to_similarity(score: float) -> float:
+        return max(0.0, min(1.0, float(1.0 / (1.0 + max(score, 0.0)))))
+
+    def _get_document_by_chunk_id(self, chunk_id: str) -> Document | None:
+        return next((d for d in self.documents if d.metadata["chunk_id"] == chunk_id), None)
+
+    def _select_graph_neighbors(self, chunk_id: str, hop_limit: int) -> List[tuple[str, int, float]]:
+        if chunk_id not in self.graph or hop_limit <= 0:
+            return []
+
+        visited = {chunk_id}
+        frontier = [(chunk_id, 0)]
+        selected: List[tuple[str, int, float]] = []
+
+        while frontier and len(selected) < self.max_graph_expansion:
+            current_id, depth = frontier.pop(0)
+            if depth >= hop_limit:
+                continue
+
+            neighbors = []
+            for neighbor_id in self.graph.neighbors(current_id):
+                if neighbor_id in visited:
+                    continue
+                edge_data = self.graph.get_edge_data(current_id, neighbor_id) or {}
+                edge_type = edge_data.get("type", "semantic")
+                edge_weight = float(edge_data.get("weight", 0.0))
+                edge_priority = 2.0 if edge_type == "sequential" else 1.0
+                neighbors.append((neighbor_id, depth + 1, edge_weight, edge_priority))
+
+            neighbors.sort(key=lambda item: (item[3], item[2]), reverse=True)
+
+            for neighbor_id, next_depth, edge_weight, _ in neighbors[:2]:
+                visited.add(neighbor_id)
+                frontier.append((neighbor_id, next_depth))
+                selected.append((neighbor_id, next_depth, edge_weight))
+                if len(selected) >= self.max_graph_expansion:
+                    break
+
+        return selected
+
+    def _trim_context(self, docs: List[Document], scores: List[float]) -> tuple[List[Document], List[float]]:
+        ranked = list(zip(docs, scores))
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        ranked = ranked[: self.max_context_docs]
+        return [doc for doc, _ in ranked], [score for _, score in ranked]
+
+    @staticmethod
+    def _normalize_tokens(text: str) -> List[str]:
+        return re.findall(r"[\w'’]+", text.lower())
+
+    def _query_tokens(self, query: str) -> set[str]:
+        return {
+            token for token in self._normalize_tokens(query)
+            if len(token) > 2 and token not in {"це", "що", "яка", "який", "яке", "таке", "про", "для"}
+        }
+
+    def _is_definition_query(self, query: str) -> bool:
+        lowered = query.lower()
+        return any(marker in lowered for marker in (" це", "що таке", "визначення"))
+
+    def _query_mode(self, query: str) -> str:
+        lowered = query.lower().strip()
+        if self._is_definition_query(query):
+            return "definition"
+        if lowered.startswith("скільки") or lowered.startswith("хто") or lowered.startswith("коли"):
+            return "factoid"
+        if lowered.startswith("які") or lowered.startswith("яка") or lowered.startswith("які є"):
+            return "list"
+        if lowered.startswith("чи "):
+            return "yes_no"
+        if lowered.startswith("як "):
+            return "process"
+        return "general"
+
+    def _lexical_overlap_score(self, query: str, doc: Document) -> float:
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return 0.0
+        doc_tokens = set(self._normalize_tokens(doc.page_content))
+        overlap = len(query_tokens & doc_tokens)
+        return overlap / len(query_tokens)
+
+    def _phrase_match_bonus(self, query: str, doc: Document) -> float:
+        query_tokens = list(self._query_tokens(query))
+        if len(query_tokens) < 2:
+            return 0.0
+        phrase = " ".join(query_tokens)
+        content = doc.page_content.lower()
+        if phrase in content:
+            return 0.2
+        return 0.0
+
+    def _sentence_evidence_score(self, query: str, sentence: str) -> float:
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return 0.0
+        sentence_lower = sentence.lower()
+        sentence_tokens = set(self._normalize_tokens(sentence))
+        overlap = len(query_tokens & sentence_tokens)
+        lexical_score = overlap / len(query_tokens)
+        phrase_match = " ".join(query_tokens) in sentence_lower if len(query_tokens) >= 2 else False
+        mode = self._query_mode(query)
+
+        evidence_bonus = 0.0
+        if mode == "definition":
+            if " — це " in sentence_lower or " це " in sentence_lower or "що таке" in sentence_lower:
+                evidence_bonus += 0.25
+            if any(token in sentence_tokens for token in query_tokens):
+                evidence_bonus += 0.1
+            if len(sentence.split()) <= 28 and overlap >= max(1, len(query_tokens) - 1):
+                evidence_bonus += 0.12
+        elif mode == "list":
+            if any(marker in sentence_lower for marker in ("типи", "види", "тополог", "класиф", ":")):
+                evidence_bonus += 0.2
+            if sentence_lower.count(",") >= 2:
+                evidence_bonus += 0.1
+            if any(marker in sentence_lower for marker in ("перш", "друг", "трет", "1)", "2)", "3)")):
+                evidence_bonus += 0.15
+        elif mode == "factoid":
+            if any(char.isdigit() for char in sentence):
+                evidence_bonus += 0.18
+            if any(marker in sentence_lower for marker in ("чинний", "обирається", "року", "літер", "букв", "президент", "є ")):
+                evidence_bonus += 0.16
+        elif mode == "yes_no":
+            if any(marker in sentence_lower for marker in ("може", "неможе", "не може", "здат", "дозволя")):
+                evidence_bonus += 0.15
+        elif mode == "process":
+            if any(marker in sentence_lower for marker in ("етап", "крок", "процес", "спочатку", "далі", "потім")):
+                evidence_bonus += 0.15
+
+        score = 0.65 * lexical_score + evidence_bonus + (0.15 if phrase_match else 0.0)
+        return min(score, 1.0)
+
+    def _is_list_like_sentence(self, sentence: str) -> bool:
+        sentence_lower = sentence.lower()
+        return (
+            sentence_lower.count(",") >= 2
+            or any(marker in sentence_lower for marker in ("типи", "види", "тополог", "класиф", "перш", "друг", "трет", ":"))
+        )
+
+    @staticmethod
+    def _clean_fragment(text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", text).strip(" -:;,.\n\t")
+        return cleaned
+
+    def _extract_list_answer_from_doc(self, query: str, doc: Document) -> str | None:
+        if self._query_mode(query) != "list":
+            return None
+        content = re.sub(r"\s+", " ", doc.page_content).strip()
+        if not content:
+            return None
+
+        patterns = [
+            r"[Тт]ипи[^:]{0,80}:\s*(.+)",
+            r"[Вв]иди[^:]{0,80}:\s*(.+)",
+            r"[Кк]ласиф[^:]{0,80}:\s*(.+)",
+            r"[Тт]ополог[^:]{0,80}:\s*(.+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content)
+            if not match:
+                continue
+            tail = match.group(1)
+            stop_match = re.search(r"(?:Перехід:|Слайд \d+|$)", tail)
+            if stop_match:
+                tail = tail[:stop_match.start()] if stop_match.start() > 0 else tail
+            parts = re.split(r"(?:(?<=\.)\s+)|;", tail)
+            normalized_parts = []
+            for part in parts:
+                piece = self._clean_fragment(part)
+                if len(piece) < 6:
+                    continue
+                if piece.lower().startswith("перехід"):
+                    continue
+                normalized_parts.append(piece)
+            if normalized_parts:
+                return "; ".join(normalized_parts[:5]) + "."
+
+        labeled_items = re.findall(r"([А-ЯA-ZІЇЄҐ][^:]{2,60}:\s*[^.\n]{5,140})", content)
+        filtered_items = []
+        for item in labeled_items:
+            cleaned = self._clean_fragment(item)
+            if cleaned.lower().startswith("слайд") or cleaned.lower().startswith("перехід"):
+                continue
+            filtered_items.append(cleaned)
+        if len(filtered_items) >= 2:
+            return "; ".join(filtered_items[:5]) + "."
+        return None
+
+    def _doc_evidence_score(self, query: str, doc: Document) -> float:
+        if self._query_mode(query) == "list" and self._extract_list_answer_from_doc(query, doc):
+            return 0.95
+        sentences = re.split(r"(?<=[.!?])\s+|\n+", doc.page_content)
+        best_score = 0.0
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) < 20:
+                continue
+            best_score = max(best_score, self._sentence_evidence_score(query, sentence))
+        return best_score
+
+    def _meets_definition_match_threshold(self, query: str, doc: Document) -> bool:
+        if not self._is_definition_query(query):
+            return True
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return True
+        lexical_score = self._lexical_overlap_score(query, doc)
+        phrase_bonus = self._phrase_match_bonus(query, doc)
+        if len(query_tokens) <= 3:
+            return lexical_score >= 0.99 or phrase_bonus > 0.0
+        return lexical_score >= 0.6 or phrase_bonus > 0.0
+
+    def _score_doc_against_query(self, query: str, doc: Document, raw_score: float) -> float:
+        base_similarity = self._distance_to_similarity(raw_score)
+        lexical_score = self._lexical_overlap_score(query, doc)
+        phrase_bonus = self._phrase_match_bonus(query, doc)
+        evidence_score = self._doc_evidence_score(query, doc)
+        final_score = 0.35 * base_similarity + 0.25 * lexical_score + 0.25 * evidence_score + phrase_bonus
+        if self._is_definition_query(query) and lexical_score < 0.5:
+            final_score *= 0.55
+        return min(final_score, 1.0)
+
+    def _definition_candidate_score(self, query: str, doc: Document) -> float:
+        lexical_score = self._lexical_overlap_score(query, doc)
+        phrase_bonus = self._phrase_match_bonus(query, doc)
+        content = doc.page_content.lower()
+        definitional_bonus = 0.0
+        if " — це " in content or " це " in content or "що таке" in content:
+            definitional_bonus = 0.2
+        score = 0.7 * lexical_score + phrase_bonus + definitional_bonus
+        return min(score, 1.0)
+
+    def _retrieve_definition_candidates(self, query: str, k: int) -> List[tuple[Document, float]]:
+        if not self.documents:
+            return []
+        ranked: List[tuple[Document, float]] = []
+        for doc in self.documents:
+            if not self._meets_definition_match_threshold(query, doc):
+                continue
+            score = self._definition_candidate_score(query, doc)
+            if score >= 0.45:
+                ranked.append((doc, score))
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        return ranked[:k]
+
+    def _deduplicate_docs(self, docs: List[Document], scores: List[float]) -> tuple[List[Document], List[float]]:
+        best_by_chunk: Dict[str, tuple[Document, float]] = {}
+        for doc, score in zip(docs, scores):
+            chunk_id = doc.metadata["chunk_id"]
+            current = best_by_chunk.get(chunk_id)
+            if current is None or score > current[1]:
+                best_by_chunk[chunk_id] = (doc, score)
+        deduped = list(best_by_chunk.values())
+        deduped.sort(key=lambda item: item[1], reverse=True)
+        return [doc for doc, _ in deduped], [score for _, score in deduped]
+
+    def _compute_query_alignment(self, query: str, docs: List[Document], scores: List[float]) -> tuple[float, float]:
+        query_tokens = self._query_tokens(query)
+        if not docs:
+            return 0.0, 0.0
+        if not query_tokens:
+            top_match = max(scores) if scores else 0.0
+            return top_match, top_match
+
+        per_doc_alignments = []
+        for doc, score in zip(docs, scores):
+            doc_tokens = set(self._normalize_tokens(doc.page_content))
+            overlap = len(query_tokens & doc_tokens)
+            lexical_score = overlap / len(query_tokens)
+            per_doc_alignments.append(0.6 * score + 0.4 * lexical_score)
+
+        top_match = max(per_doc_alignments) if per_doc_alignments else 0.0
+        alignment = float(np.mean(per_doc_alignments)) if per_doc_alignments else 0.0
+        return alignment, top_match
+
+    def _compute_answer_evidence(self, query: str, docs: List[Document]) -> float:
+        if not docs:
+            return 0.0
+        evidence_scores = [self._doc_evidence_score(query, doc) for doc in docs]
+        if not evidence_scores:
+            return 0.0
+        top_evidence = max(evidence_scores)
+        avg_evidence = float(np.mean(evidence_scores))
+        evidence = min(1.0, 0.7 * top_evidence + 0.3 * avg_evidence)
+        if self._query_mode(query) == "list":
+            list_like_hits = 0
+            for doc in docs:
+                sentences = re.split(r"(?<=[.!?])\s+|\n+", doc.page_content)
+                if any(self._is_list_like_sentence(sentence.strip()) for sentence in sentences if sentence.strip()):
+                    list_like_hits += 1
+            if list_like_hits == 0:
+                evidence *= 0.45
+            elif list_like_hits == 1:
+                evidence *= 0.75
+        return evidence
+
+    def _rerank_candidates(
+        self,
+        query: str,
+        candidates: List[tuple[Document, float]],
+        top_k: int,
+    ) -> List[tuple[Document, float]]:
+        if not candidates:
+            return []
+
+        reranked: List[tuple[Document, float]] = []
+        for doc, raw_score in candidates:
+            final_score = self._score_doc_against_query(query, doc, raw_score)
+            reranked.append((doc, min(final_score, 1.0)))
+
+        reranked.sort(key=lambda item: item[1], reverse=True)
+        return reranked[:top_k]
+
+    def _retrieve_candidates(self, query: str, k: int) -> List[tuple[Document, float]]:
+        if self._is_definition_query(query):
+            definition_candidates = self._retrieve_definition_candidates(query, k=k)
+            if definition_candidates:
+                return definition_candidates
+        pool_k = max(k, self.rerank_pool_size)
+        initial = self.vector_store.similarity_search_with_score(query, k=pool_k)
+        reranked = self._rerank_candidates(query, initial, top_k=pool_k)
+        if self._is_definition_query(query):
+            strong = [
+                (doc, score) for doc, score in reranked
+                if self._meets_definition_match_threshold(query, doc)
+            ]
+            if strong:
+                return strong[:k]
+        return reranked[:k]
+
+    def _extractive_answer(self, query: str, context_docs: List[Document]) -> str | None:
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return None
+
+        best_sentence = None
+        best_score = 0.0
+        mode = self._query_mode(query)
+        is_definition_query = mode == "definition"
+
+        query_lower = query.lower().strip()
+        focus_query = query_lower
+        for prefix in ("що таке ", "що таке", "визначення ", "визначення"):
+            if focus_query.startswith(prefix):
+                focus_query = focus_query[len(prefix):].strip()
+        focus_query = re.sub(r"[?!.:,;]+$", "", focus_query).strip()
+        focus_tokens = set(self._normalize_tokens(focus_query))
+
+        if mode == "list":
+            best_list_answer = None
+            best_list_score = 0.0
+            for doc in context_docs:
+                list_answer = self._extract_list_answer_from_doc(query, doc)
+                if not list_answer:
+                    continue
+                score = self._doc_evidence_score(query, doc)
+                if score > best_list_score:
+                    best_list_score = score
+                    best_list_answer = list_answer
+            if best_list_answer and best_list_score >= 0.7:
+                return best_list_answer
+
+        for doc in context_docs:
+            doc_source = str(doc.metadata.get("source", "")).lower()
+            source_tokens = set(self._normalize_tokens(doc_source))
+            doc_title_bias = 0.0
+            if is_definition_query and focus_query:
+                if f": {focus_query}" in doc_source or doc_source.endswith(focus_query):
+                    doc_title_bias += 0.28
+                elif f": {focus_query} (" in doc_source:
+                    doc_title_bias += 0.2
+                elif any(
+                    marker in doc_source
+                    for marker in (
+                        f": велика {focus_query}",
+                        f": диференціальна {focus_query}",
+                        f": синхронне {focus_query}",
+                        f": післяпологова {focus_query}",
+                        "вільним стилем",
+                    )
+                ):
+                    doc_title_bias -= 0.2
+                if focus_tokens and source_tokens & focus_tokens == focus_tokens:
+                    doc_title_bias += 0.08
+            sentences = re.split(r"(?<=[.!?])\s+|\n+", doc.page_content)
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if len(sentence) < 20:
+                    continue
+                score = self._sentence_evidence_score(query, sentence) + doc_title_bias
+                if score <= 0.0:
+                    continue
+                sentence_lower = sentence.lower()
+                if is_definition_query:
+                    has_definition_pattern = " — це " in sentence_lower or " це " in sentence_lower or "що таке" in sentence_lower
+                    phrase_match = " ".join(query_tokens) in sentence_lower if len(query_tokens) >= 2 else False
+                    lexical_overlap = len(query_tokens & set(self._normalize_tokens(sentence))) / max(len(query_tokens), 1)
+                    looks_encyclopedic = lexical_overlap >= 0.6 and len(sentence.split()) <= 32
+                    if not (score >= 0.99 or phrase_match or (score >= 0.6 and has_definition_pattern) or looks_encyclopedic):
+                        continue
+                if mode == "list" and not self._is_list_like_sentence(sentence):
+                    continue
+                if score > best_score:
+                    best_score = score
+                    best_sentence = sentence
+
+        if is_definition_query:
+            if best_sentence and best_score >= 0.6:
+                return best_sentence
+            return "Не вдалося знайти коректне визначення у наданому контексті."
+
+        if mode == "list":
+            if best_sentence and best_score >= 0.65:
+                return best_sentence
+            return "Не вдалося знайти прямий перелік або класифікацію у наданому контексті."
+
+        if mode == "yes_no":
+            if best_sentence and best_score >= 0.5:
+                return best_sentence
+            return "У наданому контексті немає достатньо прямої відповіді на це запитання."
+
+        if mode == "factoid":
+            if best_sentence and best_score >= 0.55:
+                return best_sentence
+            return "У наданому контексті немає достатньо прямої відповіді на це фактологічне запитання."
+
+        if best_sentence and best_score >= 0.5:
+            return best_sentence
+        return None
+
+    def _answer_quality_score(self, query: str, answer: str, context_docs: List[Document]) -> float:
+        if not answer:
+            return 0.0
+        answer_lower = answer.lower().strip()
+        if answer_lower in {
+            "недостатньо контексту для відповіді.",
+            "у наданому контексті немає достатньо інформації для відповіді.",
+            "не вдалося знайти коректне визначення у наданому контексті.",
+            "не вдалося знайти прямий перелік або класифікацію у наданому контексті.",
+            "у наданому контексті немає достатньо прямої відповіді на це запитання.",
+            "у наданому контексті немає достатньо прямої відповіді на це фактологічне запитання.",
+        }:
+            return 0.0
+
+        mode = self._query_mode(query)
+        answer_tokens = set(self._normalize_tokens(answer))
+        query_tokens = self._query_tokens(query)
+        lexical = len(query_tokens & answer_tokens) / max(len(query_tokens), 1) if query_tokens else 0.0
+        evidence = 0.0
+        for doc in context_docs:
+            if answer_lower in doc.page_content.lower():
+                evidence = 1.0
+                break
+            evidence = max(evidence, self._sentence_evidence_score(query, answer))
+
+        quality = 0.45 * lexical + 0.55 * evidence
+        if mode == "definition":
+            if len(answer.split()) < 4:
+                quality *= 0.3
+            if " — " not in answer and " це " not in answer_lower and lexical < 0.5:
+                quality *= 0.45
+        elif mode == "list":
+            has_list_shape = ";" in answer or "," in answer or any(marker in answer_lower for marker in ("типи", "види", "класиф"))
+            if not has_list_shape:
+                quality *= 0.35
+        elif mode == "factoid":
+            if len(answer.split()) < 2:
+                quality *= 0.35
+            if not any(char.isdigit() for char in answer) and not any(marker in answer_lower for marker in ("президент", "чинний", "літер", "букв", "року")):
+                quality *= 0.45
+        elif mode == "general":
+            if len(answer.split()) < 3:
+                quality *= 0.5
+        return max(0.0, min(1.0, quality))
+
+    def calibrate_confidence_with_answer(self, query: str, result: RetrievalResult, answer: str) -> float:
+        answer_quality = self._answer_quality_score(query, answer, result.context_docs)
+        confidence = result.confidence_score
+        confidence = min(confidence, 0.15 + 0.85 * answer_quality)
+        if answer_quality < 0.2:
+            confidence = min(confidence, 0.18)
+        elif answer_quality < 0.4:
+            confidence = min(confidence, 0.35)
+        elif answer_quality < 0.55:
+            confidence = min(confidence, 0.52)
+        result.confidence_score = max(0.0, min(1.0, confidence))
+        return result.confidence_score
+
+    def process_documents(self, texts: List[str], metadatas=None):
+        if not texts:
+            return
+        raw_docs = []
+        for i, text in enumerate(texts):
+            meta = metadatas[i] if metadatas else {"source": f"doc_{i}"}
+            raw_docs.append(Document(page_content=text, metadata=meta))
+        self.documents = self.text_splitter.split_documents(raw_docs)
+        for i, doc in enumerate(self.documents):
+            doc.metadata["chunk_id"] = f"chunk_{i}"
+        self.vector_store = FAISS.from_documents(self.documents, self.embeddings)
+        self._build_graph()
+
+    def _build_graph(self):
+        self.graph.clear()
+        for doc in self.documents:
+            self.graph.add_node(
+                doc.metadata["chunk_id"],
+                content=doc.page_content,
+                source=doc.metadata.get("source", "unknown"),
+            )
+        for i in range(len(self.documents) - 1):
+            d1, d2 = self.documents[i], self.documents[i + 1]
+            if d1.metadata.get("source") == d2.metadata.get("source"):
+                self.graph.add_edge(
+                    d1.metadata["chunk_id"],
+                    d2.metadata["chunk_id"],
+                    type="sequential",
+                    weight=1.0,
+                )
+        for doc in self.documents:
+            similar = self.vector_store.similarity_search_with_score(doc.page_content, k=4)
+            for sim_doc, score in similar:
+                if sim_doc.metadata["chunk_id"] != doc.metadata["chunk_id"]:
+                    weight = float(1.0 / (1.0 + score))
+                    if weight > 0.45:
+                        self.graph.add_edge(
+                            doc.metadata["chunk_id"],
+                            sim_doc.metadata["chunk_id"],
+                            type="semantic",
+                            weight=weight,
+                        )
+
+    def retrieve_with_graph(self, query: str, k: int = 3, hop_limit: int = 1) -> RetrievalResult:
+        result = RetrievalResult()
+        if not self.vector_store:
+            return result
+        initial = self._retrieve_candidates(query, k=k)
+        if not initial:
+            return result
+        retrieved_ids = set()
+        direct_scores = []
+        for doc, score in initial:
+            cid = doc.metadata["chunk_id"]
+            retrieved_ids.add(cid)
+            result.context_docs.append(doc)
+            base_similarity = float(score)
+            direct_scores.append(base_similarity)
+            if not self._meets_definition_match_threshold(query, doc):
+                continue
+            ranked_neighbors = []
+            for nbr_id, dist, edge_weight in self._select_graph_neighbors(cid, hop_limit):
+                if edge_weight < self.min_graph_edge_weight or nbr_id in retrieved_ids:
+                    continue
+                nbr_doc = self._get_document_by_chunk_id(nbr_id)
+                if not nbr_doc:
+                    continue
+                neighbor_raw_score = max(0.0, (1.0 / max(edge_weight, 1e-6)) - 1.0)
+                query_neighbor_score = self._score_doc_against_query(query, nbr_doc, neighbor_raw_score)
+                graph_score = min(1.0, query_neighbor_score * (0.96 ** dist) * max(edge_weight, 0.5))
+                if graph_score < 0.32:
+                    continue
+                ranked_neighbors.append((nbr_doc, nbr_id, graph_score))
+
+            ranked_neighbors.sort(key=lambda item: item[2], reverse=True)
+            for nbr_doc, nbr_id, graph_score in ranked_neighbors[:2]:
+                if nbr_id in retrieved_ids:
+                    continue
+                retrieved_ids.add(nbr_id)
+                result.context_docs.append(nbr_doc)
+                direct_scores.append(graph_score)
+                result.graph_expanded_count += 1
+
+        result.context_docs, direct_scores = self._deduplicate_docs(result.context_docs, direct_scores)
+        result.context_docs, direct_scores = self._trim_context(result.context_docs, direct_scores)
+        retrieved_ids = {doc.metadata["chunk_id"] for doc in result.context_docs}
+        result.vector_scores = direct_scores
+        result.unique_sources = len({d.metadata.get("source") for d in result.context_docs})
+        result.query_alignment_score, result.top_match_score = self._compute_query_alignment(query, result.context_docs, direct_scores)
+        result.answer_evidence_score = self._compute_answer_evidence(query, result.context_docs)
+        if self.graph.nodes:
+            centrality = nx.degree_centrality(self.graph)
+            c_vals = [centrality.get(cid, 0.0) for cid in retrieved_ids]
+            result.avg_graph_centrality = float(np.mean(c_vals)) if c_vals else 0.0
+        result.confidence_score = self._compute_confidence(result)
+        return result
+
+    def retrieve_without_graph(self, query: str, k: int = 3) -> RetrievalResult:
+        result = RetrievalResult()
+        if not self.vector_store:
+            return result
+        initial = self._retrieve_candidates(query, k=k)
+        if not initial:
+            return result
+        for doc, score in initial:
+            result.context_docs.append(doc)
+            result.vector_scores.append(float(score))
+        result.context_docs, result.vector_scores = self._deduplicate_docs(result.context_docs, result.vector_scores)
+        result.context_docs, result.vector_scores = self._trim_context(result.context_docs, result.vector_scores)
+        result.unique_sources = len({d.metadata.get("source") for d in result.context_docs})
+        result.query_alignment_score, result.top_match_score = self._compute_query_alignment(query, result.context_docs, result.vector_scores)
+        result.answer_evidence_score = self._compute_answer_evidence(query, result.context_docs)
+        result.confidence_score = self._compute_confidence(result)
+        return result
+
+    def compare(self, query: str, k: int = 3, hop_limit: int = 1) -> ComparisonResult:
+        comp = ComparisonResult()
+        comp.with_graph = self.retrieve_with_graph(query, k=k, hop_limit=hop_limit)
+        comp.without_graph = self.retrieve_without_graph(query, k=k)
+        comp.answer_with_graph = self.generate_answer(query, comp.with_graph.context_docs)
+        comp.answer_without_graph = self.generate_answer(query, comp.without_graph.context_docs)
+        return comp
+
+    @staticmethod
+    def _compute_confidence(result: RetrievalResult) -> float:
+        scores = result.vector_scores
+        f1 = float(np.mean(scores)) if scores else 0.0
+        total = len(result.context_docs) if result.context_docs else 1
+        f2 = 1.0 - min(float(np.std(scores)) if len(scores) > 1 else 0.0, 1.0)
+        f3 = min(len(result.context_docs) / 6.0, 1.0)
+        f4 = 1.0 - min(result.graph_expanded_count / max(3, total), 1.0)
+        f5 = min(result.avg_graph_centrality * 2.0, 1.0)
+        f6 = result.query_alignment_score
+        f7 = result.top_match_score
+        f8 = result.answer_evidence_score
+        confidence = 0.20 * f1 + 0.10 * f2 + 0.04 * f3 + 0.06 * f4 + 0.02 * f5 + 0.18 * f6 + 0.16 * f7 + 0.24 * f8
+        if f8 < 0.35:
+            confidence = min(confidence, 0.34)
+        elif f8 < 0.5:
+            confidence = min(confidence, 0.49)
+        return max(0.0, min(1.0, confidence))
+
+    def _build_prompt_text(self, context: str, question: str) -> str:
+        SYS = chr(60) + "|system|" + chr(62)
+        USR = chr(60) + "|user|" + chr(62)
+        AST = chr(60) + "|assistant|" + chr(62)
+        EOS = chr(60) + "/s" + chr(62)
+        return (
+            f"{SYS}\n"
+            "Ти помічник для системи RAG. Відповідай ТІЛЬКИ на основі наданого контексту. "
+            "Не використовуй зовнішні знання. Якщо відповіді немає в контексті, напиши: "
+            f"'У наданому контексті немає достатньо інформації для відповіді.' Відповідай лише українською мовою.{EOS}\n"
+            f"{USR}\n"
+            f"Контекст:\n{context}\n\n"
+            f"Питання: {question}{EOS}\n"
+            f"{AST}\n"
+        )
+
+    def generate_answer(self, query: str, context_docs: List[Document]) -> str:
+        if not context_docs:
+            return "Недостатньо контексту для відповіді."
+
+        extractive_answer = self._extractive_answer(query, context_docs)
+        if extractive_answer:
+            return extractive_answer
+
+        answer_evidence = self._compute_answer_evidence(query, context_docs)
+        if answer_evidence < 0.5:
+            return "У наданому контексті немає достатньо інформації для відповіді."
+
+        context_text = "\n\n".join(
+            f"[{doc.metadata.get('source', '?')}] {doc.page_content}"
+            for doc in context_docs
+        )
+        if len(context_text) > 2200:
+            context_text = context_text[:2200] + "\n...[контекст скорочено]..."
+        prompt_text = self._build_prompt_text(context_text, query)
+        tpl = PromptTemplate(template="{full_prompt}", input_variables=["full_prompt"])
+        chain = tpl | self.llm | StrOutputParser()
+        response = chain.invoke({"full_prompt": prompt_text})
+        AST = chr(60) + "|assistant|" + chr(62)
+        if AST in response:
+            response = response.split(AST)[-1].strip()
+        response = response.strip()
+        latin_letters = sum(1 for char in response if "a" <= char.lower() <= "z")
+        cyrillic_letters = sum(1 for char in response if "а" <= char.lower() <= "я" or char.lower() == "є" or char.lower() == "і" or char.lower() == "ї" or char.lower() == "ґ")
+        if latin_letters > cyrillic_letters:
+            return "У наданому контексті немає достатньо інформації для відповіді."
+        return response
+
+    def get_subgraph_for_visualization(self, active_node_ids: List[str]) -> nx.Graph:
+        if not self.graph.nodes:
+            return nx.Graph()
+        nodes_to_include = set(active_node_ids)
+        for node_id in active_node_ids:
+            if node_id in self.graph:
+                nodes_to_include.update(self.graph.neighbors(node_id))
+        return self.graph.subgraph(nodes_to_include)
