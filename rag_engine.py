@@ -10,6 +10,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from nlp_utils import normalize_tokens
 
 
 @dataclass
@@ -23,6 +24,12 @@ class RetrievalResult:
     query_alignment_score: float = 0.0
     top_match_score: float = 0.0
     answer_evidence_score: float = 0.0
+    answer_quality_score: float = 0.0
+    provenance_records: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    confidence_factors: List[Dict[str, Any]] = field(default_factory=list)
+    confidence_band: str = ""
+    answer_citations: List[str] = field(default_factory=list)
+    answer_supporting_chunk_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -33,9 +40,93 @@ class ComparisonResult:
     answer_without_graph: str = ""
 
 
-class ProvenanceGraphRAG:
+@dataclass
+class RAGConfig:
+    chunk_size: int = 500
+    chunk_overlap: int = 50
+    max_context_docs: int = 8
+    max_graph_expansion: int = 5
+    rerank_pool_size: int = 12
+    min_graph_edge_weight: float = 0.6
+    graph_neighbor_min_score: float = 0.32
+    list_answer_min_score: float = 0.7
+    extractive_min_score_general: float = 0.5
+    extractive_min_score_definition: float = 0.6
+    extractive_min_score_list: float = 0.65
+    extractive_min_score_yes_no: float = 0.5
+    extractive_min_score_factoid: float = 0.55
+    max_context_chars_for_llm: int = 2200
 
-    def __init__(self, model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+
+@dataclass
+class ConfidenceFactorSpec:
+    name: str
+    label: str
+    weight: float
+    description: str
+
+
+class ProvenanceGraphRAG:
+    """Ядро RAG-системи з графом походження та оцінкою довіри.
+
+    Відповідає за індексацію документів, побудову графа, пошук
+    з/без графового розширення, формування відповіді та обчислення
+    багатофакторної оцінки довіри до результату.
+    """
+
+    CONFIDENCE_FACTORS: List[ConfidenceFactorSpec] = [
+        ConfidenceFactorSpec(
+            name="retrieval_similarity",
+            label="Середня релевантність retrieval",
+            weight=0.20,
+            description="Наскільки сильними в середньому були збіги між запитом і вибраними фрагментами.",
+        ),
+        ConfidenceFactorSpec(
+            name="score_stability",
+            label="Стабільність score",
+            weight=0.10,
+            description="Менший розкид між score фрагментів означає більш узгоджений контекст.",
+        ),
+        ConfidenceFactorSpec(
+            name="context_coverage",
+            label="Покриття контексту",
+            weight=0.04,
+            description="Невелика надбавка за достатню кількість фрагментів у фінальному контексті.",
+        ),
+        ConfidenceFactorSpec(
+            name="graph_precision",
+            label="Обережність графового розширення",
+            weight=0.06,
+            description="Якщо контекст не надто роздутий графом, довіра вища.",
+        ),
+        ConfidenceFactorSpec(
+            name="graph_centrality",
+            label="Центральність вузлів графа",
+            weight=0.02,
+            description="Слабкий графовий сигнал про пов'язаність вибраних вузлів.",
+        ),
+        ConfidenceFactorSpec(
+            name="query_alignment",
+            label="Відповідність запиту",
+            weight=0.18,
+            description="Наскільки фінальний контекст узгоджений із запитом.",
+        ),
+        ConfidenceFactorSpec(
+            name="top_match",
+            label="Найсильніший доказ",
+            weight=0.16,
+            description="Наявність хоча б одного дуже релевантного фрагмента суттєво підвищує довіру.",
+        ),
+        ConfidenceFactorSpec(
+            name="answer_evidence",
+            label="Підкріплення відповіді доказами",
+            weight=0.24,
+            description="Чи є в контексті речення, що прямо підтримують відповідь.",
+        ),
+    ]
+
+    def __init__(self, model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0", config: RAGConfig | None = None):
+        self.config = config or RAGConfig()
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
             model_kwargs={"device": "cpu"},
@@ -59,16 +150,12 @@ class ProvenanceGraphRAG:
         self.llm = HuggingFacePipeline(pipeline=pipe)
 
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50,
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
         )
         self.vector_store = None
         self.graph = nx.Graph()
         self.documents: List[Document] = []
-        self.max_context_docs = 8
-        self.max_graph_expansion = 5
-        self.rerank_pool_size = 12
-        self.min_graph_edge_weight = 0.6
 
     @staticmethod
     def _distance_to_similarity(score: float) -> float:
@@ -77,15 +164,15 @@ class ProvenanceGraphRAG:
     def _get_document_by_chunk_id(self, chunk_id: str) -> Document | None:
         return next((d for d in self.documents if d.metadata["chunk_id"] == chunk_id), None)
 
-    def _select_graph_neighbors(self, chunk_id: str, hop_limit: int) -> List[tuple[str, int, float]]:
+    def _select_graph_neighbors(self, chunk_id: str, hop_limit: int) -> List[tuple[str, int, float, str]]:
         if chunk_id not in self.graph or hop_limit <= 0:
             return []
 
         visited = {chunk_id}
         frontier = [(chunk_id, 0)]
-        selected: List[tuple[str, int, float]] = []
+        selected: List[tuple[str, int, float, str]] = []
 
-        while frontier and len(selected) < self.max_graph_expansion:
+        while frontier and len(selected) < self.config.max_graph_expansion:
             current_id, depth = frontier.pop(0)
             if depth >= hop_limit:
                 continue
@@ -98,15 +185,15 @@ class ProvenanceGraphRAG:
                 edge_type = edge_data.get("type", "semantic")
                 edge_weight = float(edge_data.get("weight", 0.0))
                 edge_priority = 2.0 if edge_type == "sequential" else 1.0
-                neighbors.append((neighbor_id, depth + 1, edge_weight, edge_priority))
+                neighbors.append((neighbor_id, depth + 1, edge_weight, edge_priority, edge_type))
 
             neighbors.sort(key=lambda item: (item[3], item[2]), reverse=True)
 
-            for neighbor_id, next_depth, edge_weight, _ in neighbors[:2]:
+            for neighbor_id, next_depth, edge_weight, _, edge_type in neighbors[:2]:
                 visited.add(neighbor_id)
                 frontier.append((neighbor_id, next_depth))
-                selected.append((neighbor_id, next_depth, edge_weight))
-                if len(selected) >= self.max_graph_expansion:
+                selected.append((neighbor_id, next_depth, edge_weight, edge_type))
+                if len(selected) >= self.config.max_graph_expansion:
                     break
 
         return selected
@@ -114,12 +201,12 @@ class ProvenanceGraphRAG:
     def _trim_context(self, docs: List[Document], scores: List[float]) -> tuple[List[Document], List[float]]:
         ranked = list(zip(docs, scores))
         ranked.sort(key=lambda item: item[1], reverse=True)
-        ranked = ranked[: self.max_context_docs]
+        ranked = ranked[: self.config.max_context_docs]
         return [doc for doc, _ in ranked], [score for _, score in ranked]
 
     @staticmethod
     def _normalize_tokens(text: str) -> List[str]:
-        return re.findall(r"[\w'’]+", text.lower())
+        return normalize_tokens(text)
 
     def _query_tokens(self, query: str) -> set[str]:
         return {
@@ -390,7 +477,7 @@ class ProvenanceGraphRAG:
             definition_candidates = self._retrieve_definition_candidates(query, k=k)
             if definition_candidates:
                 return definition_candidates
-        pool_k = max(k, self.rerank_pool_size)
+        pool_k = max(k, self.config.rerank_pool_size)
         initial = self.vector_store.similarity_search_with_score(query, k=pool_k)
         reranked = self._rerank_candidates(query, initial, top_k=pool_k)
         if self._is_definition_query(query):
@@ -431,7 +518,7 @@ class ProvenanceGraphRAG:
                 if score > best_list_score:
                     best_list_score = score
                     best_list_answer = list_answer
-            if best_list_answer and best_list_score >= 0.7:
+            if best_list_answer and best_list_score >= self.config.list_answer_min_score:
                 return best_list_answer
 
         for doc in context_docs:
@@ -479,32 +566,173 @@ class ProvenanceGraphRAG:
                     best_sentence = sentence
 
         if is_definition_query:
-            if best_sentence and best_score >= 0.6:
+            if best_sentence and best_score >= self.config.extractive_min_score_definition:
                 return best_sentence
             return "Не вдалося знайти коректне визначення у наданому контексті."
 
         if mode == "list":
-            if best_sentence and best_score >= 0.65:
+            if best_sentence and best_score >= self.config.extractive_min_score_list:
                 return best_sentence
             return "Не вдалося знайти прямий перелік або класифікацію у наданому контексті."
 
         if mode == "yes_no":
-            if best_sentence and best_score >= 0.5:
+            if best_sentence and best_score >= self.config.extractive_min_score_yes_no:
                 return best_sentence
             return "У наданому контексті немає достатньо прямої відповіді на це запитання."
 
         if mode == "factoid":
-            if best_sentence and best_score >= 0.55:
+            if best_sentence and best_score >= self.config.extractive_min_score_factoid:
                 return best_sentence
             return "У наданому контексті немає достатньо прямої відповіді на це фактологічне запитання."
 
-        if best_sentence and best_score >= 0.5:
+        if best_sentence and best_score >= self.config.extractive_min_score_general:
             return best_sentence
         return None
+
+    @staticmethod
+    def _doc_reference(doc: Document) -> str:
+        return f"{doc.metadata.get('source', '?')} [{doc.metadata.get('chunk_id', '?')}]"
+
+    def _record_direct_provenance(
+        self,
+        result: RetrievalResult,
+        doc: Document,
+        score: float,
+        retrieval_mode: str,
+        reason: str,
+    ) -> None:
+        chunk_id = doc.metadata["chunk_id"]
+        current = result.provenance_records.get(chunk_id)
+        if current is not None and float(current.get("retrieval_score", 0.0)) >= float(score):
+            return
+        result.provenance_records[chunk_id] = {
+            "chunk_id": chunk_id,
+            "source": doc.metadata.get("source", "unknown"),
+            "retrieval_mode": retrieval_mode,
+            "retrieval_score": float(score),
+            "reason": reason,
+            "path": [
+                {
+                    "from": "query",
+                    "to": chunk_id,
+                    "relation": retrieval_mode,
+                    "score": round(float(score), 3),
+                    "reason": reason,
+                }
+            ],
+        }
+
+    def _record_graph_provenance(
+        self,
+        result: RetrievalResult,
+        seed_doc: Document,
+        doc: Document,
+        score: float,
+        hop_distance: int,
+        edge_type: str,
+        edge_weight: float,
+    ) -> None:
+        chunk_id = doc.metadata["chunk_id"]
+        seed_chunk_id = seed_doc.metadata["chunk_id"]
+        current = result.provenance_records.get(chunk_id)
+        if current is not None and float(current.get("retrieval_score", 0.0)) >= float(score):
+            return
+        seed_record = result.provenance_records.get(seed_chunk_id)
+        seed_path = list(seed_record.get("path", [])) if seed_record else []
+        result.provenance_records[chunk_id] = {
+            "chunk_id": chunk_id,
+            "source": doc.metadata.get("source", "unknown"),
+            "retrieval_mode": "graph_expansion",
+            "retrieval_score": float(score),
+            "reason": f"Expanded from {seed_chunk_id} via {edge_type}",
+            "seed_chunk_id": seed_chunk_id,
+            "hop_distance": hop_distance,
+            "edge_type": edge_type,
+            "edge_weight": float(edge_weight),
+            "path": seed_path + [
+                {
+                    "from": seed_chunk_id,
+                    "to": chunk_id,
+                    "relation": f"graph_{edge_type}",
+                    "score": round(float(score), 3),
+                    "edge_weight": round(float(edge_weight), 3),
+                    "hop_distance": hop_distance,
+                    "reason": f"Graph expansion over {edge_type} edge",
+                }
+            ],
+        }
+
+    def _prune_provenance_records(self, result: RetrievalResult) -> None:
+        selected = {doc.metadata["chunk_id"] for doc in result.context_docs}
+        result.provenance_records = {
+            chunk_id: record
+            for chunk_id, record in result.provenance_records.items()
+            if chunk_id in selected
+        }
+        score_by_chunk = {
+            doc.metadata["chunk_id"]: float(score)
+            for doc, score in zip(result.context_docs, result.vector_scores)
+        }
+        for rank, doc in enumerate(result.context_docs, start=1):
+            chunk_id = doc.metadata["chunk_id"]
+            record = result.provenance_records.get(chunk_id)
+            if record is None:
+                self._record_direct_provenance(
+                    result,
+                    doc,
+                    score_by_chunk.get(chunk_id, 0.0),
+                    retrieval_mode="retrieval",
+                    reason="Selected for final context",
+                )
+                record = result.provenance_records.get(chunk_id)
+            record["rank"] = rank
+            record["retrieval_score"] = score_by_chunk.get(chunk_id, 0.0)
+
+    def _select_supporting_docs(self, query: str, answer: str, context_docs: List[Document]) -> List[Document]:
+        ranked_support = []
+        answer_tokens = set(self._normalize_tokens(answer))
+        for doc in context_docs:
+            support = self._doc_evidence_score(query, doc)
+            if answer and answer.lower() in doc.page_content.lower():
+                support += 0.25
+            overlap = len(answer_tokens & set(self._normalize_tokens(doc.page_content)))
+            support += min(0.15, 0.03 * overlap)
+            ranked_support.append((support, doc))
+        ranked_support.sort(key=lambda item: item[0], reverse=True)
+        return [doc for score, doc in ranked_support[:3] if score >= 0.35]
+
+    def _format_answer_with_citations(self, answer: str, citations: List[str]) -> str:
+        if not citations or "\n\nДжерела:" in answer:
+            return answer
+        return f"{answer}\n\nДжерела: {', '.join(citations)}"
+
+    def _attach_answer_provenance(self, query: str, result: RetrievalResult, answer: str) -> str:
+        answer_body = answer.split("\n\nДжерела:", 1)[0].strip()
+        fallback_answers = {
+            "Недостатньо контексту для відповіді.",
+            "У наданому контексті немає достатньо інформації для відповіді.",
+            "Не вдалося знайти коректне визначення у наданому контексті.",
+            "Не вдалося знайти прямий перелік або класифікацію у наданому контексті.",
+            "У наданому контексті немає достатньо прямої відповіді на це запитання.",
+            "У наданому контексті немає достатньо прямої відповіді на це фактологічне запитання.",
+        }
+        if answer_body in fallback_answers:
+            result.answer_citations = []
+            result.answer_supporting_chunk_ids = []
+            return answer_body
+        supporting_docs = self._select_supporting_docs(query, answer_body, result.context_docs)
+        result.answer_supporting_chunk_ids = [doc.metadata.get("chunk_id") for doc in supporting_docs]
+        result.answer_citations = [self._doc_reference(doc) for doc in supporting_docs]
+        return self._format_answer_with_citations(answer_body, result.answer_citations)
+
+    def generate_answer_with_provenance(self, query: str, result: RetrievalResult) -> str:
+        answer = self.generate_answer(query, result.context_docs)
+        return self._attach_answer_provenance(query, result, answer)
 
     def _answer_quality_score(self, query: str, answer: str, context_docs: List[Document]) -> float:
         if not answer:
             return 0.0
+        answer = answer.split("\n\nДжерела:", 1)[0].strip()
         answer_lower = answer.lower().strip()
         if answer_lower in {
             "недостатньо контексту для відповіді.",
@@ -549,7 +777,9 @@ class ProvenanceGraphRAG:
 
     def calibrate_confidence_with_answer(self, query: str, result: RetrievalResult, answer: str) -> float:
         answer_quality = self._answer_quality_score(query, answer, result.context_docs)
+        result.answer_quality_score = answer_quality
         confidence = result.confidence_score
+        base_confidence = confidence
         confidence = min(confidence, 0.15 + 0.85 * answer_quality)
         if answer_quality < 0.2:
             confidence = min(confidence, 0.18)
@@ -558,9 +788,29 @@ class ProvenanceGraphRAG:
         elif answer_quality < 0.55:
             confidence = min(confidence, 0.52)
         result.confidence_score = max(0.0, min(1.0, confidence))
+        result.confidence_factors = [
+            factor for factor in result.confidence_factors
+            if factor.get("name") != "answer_quality_calibration"
+        ]
+        result.confidence_factors.append(
+            {
+                "name": "answer_quality_calibration",
+                "label": "Якість сформованої відповіді",
+                "value": round(answer_quality, 3),
+                "weight": 0.0,
+                "contribution": round(result.confidence_score - base_confidence, 3),
+                "description": "Після генерації confidence обмежується, якщо відповідь слабо підкріплена контекстом.",
+            }
+        )
+        result.confidence_band = self._confidence_band(result.confidence_score)
         return result.confidence_score
 
     def process_documents(self, texts: List[str], metadatas=None):
+        """Індексує сирі тексти, розбиває на фрагменти та будує граф.
+
+        На виході створюється векторний індекс (FAISS) і граф
+        послідовних та семантичних зв'язків між chunk'ами.
+        """
         if not texts:
             return
         raw_docs = []
@@ -576,6 +826,7 @@ class ProvenanceGraphRAG:
     def _build_graph(self):
         self.graph.clear()
         for doc in self.documents:
+            assert "chunk_id" in doc.metadata, "Document is missing 'chunk_id' in metadata during graph build"
             self.graph.add_node(
                 doc.metadata["chunk_id"],
                 content=doc.page_content,
@@ -604,6 +855,12 @@ class ProvenanceGraphRAG:
                         )
 
     def retrieve_with_graph(self, query: str, k: int = 3, hop_limit: int = 1) -> RetrievalResult:
+        """Пошук релевантних фрагментів з графовим розширенням контексту.
+
+        Спочатку обирає seed-фрагменти з векторного індексу, потім
+        додає сусідів у графі за обмеженнями на вагу ребер і кількість
+        кроків, формуючи розширений контекст та метрики довіри.
+        """
         result = RetrievalResult()
         if not self.vector_store:
             return result
@@ -618,11 +875,18 @@ class ProvenanceGraphRAG:
             result.context_docs.append(doc)
             base_similarity = float(score)
             direct_scores.append(base_similarity)
+            self._record_direct_provenance(
+                result,
+                doc,
+                base_similarity,
+                retrieval_mode="vector_seed",
+                reason="Direct retrieval from vector index",
+            )
             if not self._meets_definition_match_threshold(query, doc):
                 continue
             ranked_neighbors = []
-            for nbr_id, dist, edge_weight in self._select_graph_neighbors(cid, hop_limit):
-                if edge_weight < self.min_graph_edge_weight or nbr_id in retrieved_ids:
+            for nbr_id, dist, edge_weight, edge_type in self._select_graph_neighbors(cid, hop_limit):
+                if edge_weight < self.config.min_graph_edge_weight or nbr_id in retrieved_ids:
                     continue
                 nbr_doc = self._get_document_by_chunk_id(nbr_id)
                 if not nbr_doc:
@@ -630,23 +894,33 @@ class ProvenanceGraphRAG:
                 neighbor_raw_score = max(0.0, (1.0 / max(edge_weight, 1e-6)) - 1.0)
                 query_neighbor_score = self._score_doc_against_query(query, nbr_doc, neighbor_raw_score)
                 graph_score = min(1.0, query_neighbor_score * (0.96 ** dist) * max(edge_weight, 0.5))
-                if graph_score < 0.32:
+                if graph_score < self.config.graph_neighbor_min_score:
                     continue
-                ranked_neighbors.append((nbr_doc, nbr_id, graph_score))
+                ranked_neighbors.append((nbr_doc, nbr_id, graph_score, dist, edge_type, edge_weight, doc))
 
             ranked_neighbors.sort(key=lambda item: item[2], reverse=True)
-            for nbr_doc, nbr_id, graph_score in ranked_neighbors[:2]:
+            for nbr_doc, nbr_id, graph_score, dist, edge_type, edge_weight, seed_doc in ranked_neighbors[:2]:
                 if nbr_id in retrieved_ids:
                     continue
                 retrieved_ids.add(nbr_id)
                 result.context_docs.append(nbr_doc)
                 direct_scores.append(graph_score)
                 result.graph_expanded_count += 1
+                self._record_graph_provenance(
+                    result,
+                    seed_doc,
+                    nbr_doc,
+                    graph_score,
+                    hop_distance=dist,
+                    edge_type=edge_type,
+                    edge_weight=edge_weight,
+                )
 
         result.context_docs, direct_scores = self._deduplicate_docs(result.context_docs, direct_scores)
         result.context_docs, direct_scores = self._trim_context(result.context_docs, direct_scores)
         retrieved_ids = {doc.metadata["chunk_id"] for doc in result.context_docs}
         result.vector_scores = direct_scores
+        self._prune_provenance_records(result)
         result.unique_sources = len({d.metadata.get("source") for d in result.context_docs})
         result.query_alignment_score, result.top_match_score = self._compute_query_alignment(query, result.context_docs, direct_scores)
         result.answer_evidence_score = self._compute_answer_evidence(query, result.context_docs)
@@ -658,6 +932,11 @@ class ProvenanceGraphRAG:
         return result
 
     def retrieve_without_graph(self, query: str, k: int = 3) -> RetrievalResult:
+        """Базовий RAG-пошук без використання графа походження.
+
+        Використовує лише векторний індекс для відбору фрагментів
+        і обчислює метрики довіри без графового розширення.
+        """
         result = RetrievalResult()
         if not self.vector_store:
             return result
@@ -667,8 +946,16 @@ class ProvenanceGraphRAG:
         for doc, score in initial:
             result.context_docs.append(doc)
             result.vector_scores.append(float(score))
+            self._record_direct_provenance(
+                result,
+                doc,
+                float(score),
+                retrieval_mode="vector",
+                reason="Direct retrieval without graph expansion",
+            )
         result.context_docs, result.vector_scores = self._deduplicate_docs(result.context_docs, result.vector_scores)
         result.context_docs, result.vector_scores = self._trim_context(result.context_docs, result.vector_scores)
+        self._prune_provenance_records(result)
         result.unique_sources = len({d.metadata.get("source") for d in result.context_docs})
         result.query_alignment_score, result.top_match_score = self._compute_query_alignment(query, result.context_docs, result.vector_scores)
         result.answer_evidence_score = self._compute_answer_evidence(query, result.context_docs)
@@ -676,15 +963,29 @@ class ProvenanceGraphRAG:
         return result
 
     def compare(self, query: str, k: int = 3, hop_limit: int = 1) -> ComparisonResult:
+        """Порівнює RAG з графом походження та базовий RAG.
+
+        Виконує два запити (з графом і без), генерує відповіді та
+        повертає структуру для аналізу різниці у контексті й довірі.
+        """
         comp = ComparisonResult()
         comp.with_graph = self.retrieve_with_graph(query, k=k, hop_limit=hop_limit)
         comp.without_graph = self.retrieve_without_graph(query, k=k)
-        comp.answer_with_graph = self.generate_answer(query, comp.with_graph.context_docs)
-        comp.answer_without_graph = self.generate_answer(query, comp.without_graph.context_docs)
+        comp.answer_with_graph = self.generate_answer_with_provenance(query, comp.with_graph)
+        comp.answer_without_graph = self.generate_answer_with_provenance(query, comp.without_graph)
         return comp
 
     @staticmethod
-    def _compute_confidence(result: RetrievalResult) -> float:
+    def _confidence_band(score: float) -> str:
+        if score >= 0.8:
+            return "висока"
+        if score >= 0.6:
+            return "помірна"
+        if score >= 0.4:
+            return "обережна"
+        return "низька"
+
+    def _compute_confidence(self, result: RetrievalResult) -> float:
         scores = result.vector_scores
         f1 = float(np.mean(scores)) if scores else 0.0
         total = len(result.context_docs) if result.context_docs else 1
@@ -695,11 +996,40 @@ class ProvenanceGraphRAG:
         f6 = result.query_alignment_score
         f7 = result.top_match_score
         f8 = result.answer_evidence_score
-        confidence = 0.20 * f1 + 0.10 * f2 + 0.04 * f3 + 0.06 * f4 + 0.02 * f5 + 0.18 * f6 + 0.16 * f7 + 0.24 * f8
+
+        value_by_name: Dict[str, float] = {
+            "retrieval_similarity": f1,
+            "score_stability": f2,
+            "context_coverage": f3,
+            "graph_precision": f4,
+            "graph_centrality": f5,
+            "query_alignment": f6,
+            "top_match": f7,
+            "answer_evidence": f8,
+        }
+
+        factors: List[Dict[str, Any]] = []
+        for spec in self.CONFIDENCE_FACTORS:
+            raw_value = value_by_name.get(spec.name, 0.0)
+            contribution = spec.weight * raw_value
+            factors.append(
+                {
+                    "name": spec.name,
+                    "label": spec.label,
+                    "value": round(raw_value, 3),
+                    "weight": spec.weight,
+                    "contribution": round(contribution, 3),
+                    "description": spec.description,
+                }
+            )
+
+        confidence = sum(factor["contribution"] for factor in factors)
         if f8 < 0.35:
             confidence = min(confidence, 0.34)
         elif f8 < 0.5:
             confidence = min(confidence, 0.49)
+        result.confidence_factors = factors
+        result.confidence_band = self._confidence_band(confidence)
         return max(0.0, min(1.0, confidence))
 
     def _build_prompt_text(self, context: str, question: str) -> str:
@@ -734,8 +1064,8 @@ class ProvenanceGraphRAG:
             f"[{doc.metadata.get('source', '?')}] {doc.page_content}"
             for doc in context_docs
         )
-        if len(context_text) > 2200:
-            context_text = context_text[:2200] + "\n...[контекст скорочено]..."
+        if len(context_text) > self.config.max_context_chars_for_llm:
+            context_text = context_text[: self.config.max_context_chars_for_llm] + "\n...[контекст скорочено]..."
         prompt_text = self._build_prompt_text(context_text, query)
         tpl = PromptTemplate(template="{full_prompt}", input_variables=["full_prompt"])
         chain = tpl | self.llm | StrOutputParser()

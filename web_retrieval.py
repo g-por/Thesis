@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 
 import requests
 from langchain_core.documents import Document
+from nlp_utils import normalize_spaces as _normalize_spaces, normalize_tokens as _normalize_tokens
 
 
 @dataclass
@@ -43,11 +44,11 @@ class WebSearchClient:
 
     @staticmethod
     def _normalize_spaces(text: str) -> str:
-        return re.sub(r"\s+", " ", text or "").strip()
+        return _normalize_spaces(text)
 
     @staticmethod
     def _normalize_tokens(text: str) -> list[str]:
-        return re.findall(r"[\w'’]+", (text or "").lower())
+        return _normalize_tokens(text)
 
     def _expand_query(self, query: str) -> str:
         normalized = self._normalize_spaces(query)

@@ -150,6 +150,15 @@ def build_web_result(engine: ProvenanceGraphRAG, query: str, providers: list[str
     docs, scores = engine._trim_context(docs, scores)
     result.context_docs = docs
     result.vector_scores = scores
+    for doc, score in zip(result.context_docs, result.vector_scores):
+        engine._record_direct_provenance(
+            result,
+            doc,
+            float(score),
+            retrieval_mode="web_search",
+            reason=f"Retrieved from web provider {doc.metadata.get('provider', 'unknown')}",
+        )
+    engine._prune_provenance_records(result)
     result.unique_sources = len({d.metadata.get("source") for d in docs})
     result.query_alignment_score, result.top_match_score = engine._compute_query_alignment(query, docs, scores)
     result.answer_evidence_score = engine._compute_answer_evidence(query, docs)
@@ -162,8 +171,13 @@ def merge_results(engine: ProvenanceGraphRAG, query: str, local_result: Retrieva
     merged.context_docs = list(local_result.context_docs) + list(web_result.context_docs)
     merged.vector_scores = list(local_result.vector_scores) + list(web_result.vector_scores)
     merged.graph_expanded_count = local_result.graph_expanded_count
+    merged.provenance_records = {
+        **local_result.provenance_records,
+        **web_result.provenance_records,
+    }
     merged.context_docs, merged.vector_scores = engine._deduplicate_docs(merged.context_docs, merged.vector_scores)
     merged.context_docs, merged.vector_scores = engine._trim_context(merged.context_docs, merged.vector_scores)
+    engine._prune_provenance_records(merged)
     merged.unique_sources = len({d.metadata.get("source") for d in merged.context_docs})
     merged.avg_graph_centrality = local_result.avg_graph_centrality
     merged.query_alignment_score, merged.top_match_score = engine._compute_query_alignment(query, merged.context_docs, merged.vector_scores)
@@ -172,11 +186,12 @@ def merge_results(engine: ProvenanceGraphRAG, query: str, local_result: Retrieva
     merged.confidence_score = engine._compute_confidence(merged)
     if base_confidences:
         merged.confidence_score = min(1.0, 0.65 * merged.confidence_score + 0.35 * mean(base_confidences))
+        merged.confidence_band = engine._confidence_band(merged.confidence_score)
     return merged
 
 
 def build_answer(engine: ProvenanceGraphRAG, query: str, result: RetrievalResult) -> str:
-    return engine.generate_answer(query, result.context_docs)
+    return engine.generate_answer_with_provenance(query, result)
 
 
 def render_context_block(title: str, result: RetrievalResult, answer: str):
@@ -187,14 +202,46 @@ def render_context_block(title: str, result: RetrievalResult, answer: str):
     mc2.metric("Фрагментів", len(result.context_docs))
     mc3.metric("Додано графом", result.graph_expanded_count)
     mc4.metric("Джерел", result.unique_sources)
+    st.caption(f"Рівень довіри: {result.confidence_band or 'невизначено'}")
+    with st.expander("Пояснення оцінки довіри", expanded=False):
+        for factor in result.confidence_factors:
+            st.markdown(
+                f"- **{factor.get('label', factor.get('name', '?'))}**: "
+                f"value={factor.get('value', 0):.3f}, contribution={factor.get('contribution', 0):.3f}"
+            )
+            description = factor.get("description")
+            if description:
+                st.caption(description)
+    if result.answer_citations:
+        st.caption(f"Підтримуючі джерела: {', '.join(result.answer_citations)}")
     for doc in result.context_docs:
         extra = ""
         if doc.metadata.get("url"):
             extra = f"\n{doc.metadata.get('url')}"
+        chunk_id = doc.metadata.get("chunk_id")
+        support_marker = " [support]" if chunk_id in result.answer_supporting_chunk_ids else ""
         st.info(
-            f"[{doc.metadata.get('source','?')} - {doc.metadata.get('chunk_id')} ]\n"
+            f"[{doc.metadata.get('source','?')} - {chunk_id}]{support_marker}\n"
             f"{doc.page_content[:220]}...{extra}"
         )
+        record = result.provenance_records.get(chunk_id)
+        if record:
+            with st.expander(f"Provenance: {chunk_id}", expanded=False):
+                st.markdown(f"- **Режим**: {record.get('retrieval_mode', '?')}")
+                st.markdown(f"- **Причина**: {record.get('reason', '?')}")
+                st.markdown(f"- **Score**: {float(record.get('retrieval_score', 0.0)):.3f}")
+                if record.get("seed_chunk_id"):
+                    st.markdown(f"- **Seed chunk**: {record.get('seed_chunk_id')}")
+                if record.get("edge_type"):
+                    st.markdown(
+                        f"- **Graph edge**: {record.get('edge_type')} (weight={float(record.get('edge_weight', 0.0)):.3f}, hops={record.get('hop_distance', 0)})"
+                    )
+                st.markdown("- **Шлях походження:**")
+                for step in record.get("path", []):
+                    step_score = float(step.get("score", 0.0))
+                    st.markdown(
+                        f"  - `{step.get('from', '?')}` -> `{step.get('to', '?')}` через `{step.get('relation', '?')}` (score={step_score:.3f})"
+                    )
 
 
 # --- Page ---
