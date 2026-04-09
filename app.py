@@ -8,7 +8,7 @@ from statistics import mean
 from pyvis.network import Network
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-from rag_engine import ProvenanceGraphRAG, RetrievalResult
+from rag_engine import ProvenanceGraphRAG, RetrievalResult, RAGConfig
 from web_retrieval import WebSearchClient
 
 st.set_page_config(page_title="Provenance Graph RAG", layout="wide")
@@ -128,10 +128,21 @@ def build_web_graph(docs: list) -> nx.Graph:
     return graph
 
 
+def _create_engine(model_name: str) -> ProvenanceGraphRAG:
+    if model_name == "OpenAI (gpt-4o-mini)":
+        cfg = RAGConfig()
+        cfg.llm_backend = "openai"
+        cfg.openai_model = "gpt-4o-mini"
+        return ProvenanceGraphRAG(model_name="gpt-4o-mini", config=cfg, llm_backend="openai")
+    cfg = RAGConfig()
+    cfg.llm_backend = "local"
+    return ProvenanceGraphRAG(model_name=model_name, config=cfg, llm_backend="local")
+
+
 def get_engine(model_name: str) -> ProvenanceGraphRAG:
     engine = st.session_state.rag_engine
     if engine is None:
-        engine = ProvenanceGraphRAG(model_name=model_name)
+        engine = _create_engine(model_name)
         st.session_state.rag_engine = engine
     return engine
 
@@ -257,10 +268,17 @@ with st.sidebar:
     st.header("Налаштування")
 
     model_choice = st.selectbox(
-        "Локальна модель",
-        ["TinyLlama/TinyLlama-1.1B-Chat-v1.0", "Qwen/Qwen2.5-0.5B-Instruct"],
+        "Модель для генерації відповіді",
+        [
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "OpenAI (gpt-4o-mini)",
+        ],
     )
-    st.info("Модель завантажується локально. Перше завантаження може зайняти певний час.")
+    st.info(
+        "Локальні моделі завантажуються з HuggingFace. OpenAI-параметри беруться з змінної "
+        "середовища OPENAI_API_KEY."
+    )
 
     st.subheader("Режим пошуку")
     search_mode = st.radio(
@@ -271,7 +289,7 @@ with st.sidebar:
     selected_web_providers = st.multiselect(
         "Веб-провайдери",
         WEB_PROVIDER_OPTIONS,
-        default=["Wikipedia", "OpenAlex"],
+        default=["Wikipedia", "DuckDuckGo"],
     )
     web_limit = st.slider("Результатів з кожного веб-провайдера", 1, 5, 2)
 
@@ -311,7 +329,7 @@ with st.sidebar:
                         st.warning("Не вдалося отримати текст із вибраних джерел.")
                         st.stop()
 
-                    engine = ProvenanceGraphRAG(model_name=model_choice)
+                    engine = _create_engine(model_choice)
                     if texts:
                         engine.process_documents(texts, metadatas)
                     st.session_state.rag_engine = engine

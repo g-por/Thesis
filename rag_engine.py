@@ -1,6 +1,7 @@
 import networkx as nx
 import numpy as np
 import re
+import os
 from typing import List, Dict, Any
 from dataclasses import dataclass, field
 from langchain_core.documents import Document
@@ -49,13 +50,16 @@ class RAGConfig:
     rerank_pool_size: int = 12
     min_graph_edge_weight: float = 0.6
     graph_neighbor_min_score: float = 0.32
-    list_answer_min_score: float = 0.7
-    extractive_min_score_general: float = 0.5
-    extractive_min_score_definition: float = 0.6
-    extractive_min_score_list: float = 0.65
-    extractive_min_score_yes_no: float = 0.5
-    extractive_min_score_factoid: float = 0.55
+    list_answer_min_score: float = 0.6
+    extractive_min_score_general: float = 0.4
+    extractive_min_score_definition: float = 0.5
+    extractive_min_score_list: float = 0.55
+    extractive_min_score_yes_no: float = 0.45
+    extractive_min_score_factoid: float = 0.45
     max_context_chars_for_llm: int = 2200
+    llm_backend: str = "local"
+    openai_model: str = "gpt-4o-mini"
+    openai_temperature: float = 0.0
 
 
 @dataclass
@@ -125,29 +129,52 @@ class ProvenanceGraphRAG:
         ),
     ]
 
-    def __init__(self, model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0", config: RAGConfig | None = None):
+    def __init__(self, model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0", config: RAGConfig | None = None, llm_backend: str | None = None):
         self.config = config or RAGConfig()
+        if llm_backend is not None:
+            self.config.llm_backend = llm_backend
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True},
         )
 
-        print(f"Loading local LLM model: {model_name} ...")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name)
+        if self.config.llm_backend == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    "OPENAI_API_KEY environment variable is not set. "
+                    "Будь ласка, задай ключ OpenAI у змінній середовища."
+                )
+            try:
+                from langchain_openai import ChatOpenAI
+            except ImportError as exc:
+                raise ImportError(
+                    "Для використання OpenAI встанови пакет 'langchain-openai' "
+                    "та клієнт 'openai', наприклад: pip install langchain-openai openai."
+                ) from exc
 
-        pipe = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=220,
-            truncation=True,
-            repetition_penalty=1.1,
-            do_sample=False,
-        )
+            self.llm = ChatOpenAI(
+                model=self.config.openai_model,
+                temperature=self.config.openai_temperature,
+            )
+            print(f"Using OpenAI LLM model: {self.config.openai_model}")
+        else:
+            print(f"Loading local LLM model: {model_name} ...")
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(model_name)
 
-        self.llm = HuggingFacePipeline(pipeline=pipe)
+            pipe = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=tokenizer,
+                max_new_tokens=220,
+                truncation=True,
+                repetition_penalty=1.1,
+                do_sample=False,
+            )
+
+            self.llm = HuggingFacePipeline(pipeline=pipe)
 
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.chunk_size,
@@ -507,6 +534,29 @@ class ProvenanceGraphRAG:
         focus_query = re.sub(r"[?!.:,;]+$", "", focus_query).strip()
         focus_tokens = set(self._normalize_tokens(focus_query))
 
+        # Спочатку: для визначень із веб-режиму (Wikipedia) намагаємось
+        # напряму взяти перше осмислене речення з тієї статті, чий заголовок
+        # найбільше перетинається з фокусом запиту.
+        if is_definition_query and focus_tokens:
+            best_title_doc: Document | None = None
+            best_title_overlap = 0
+            for doc in context_docs:
+                provider = str(doc.metadata.get("provider", "")).lower()
+                if provider != "wikipedia":
+                    continue
+                doc_source = str(doc.metadata.get("source", "")).lower()
+                source_tokens = set(self._normalize_tokens(doc_source))
+                overlap = len(focus_tokens & source_tokens)
+                if overlap > best_title_overlap:
+                    best_title_overlap = overlap
+                    best_title_doc = doc
+            if best_title_doc is not None and best_title_overlap >= 1:
+                sentences = re.split(r"(?<=[.!?])\s+|\n+", best_title_doc.page_content)
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    if len(sentence) >= 20:
+                        return sentence
+
         if mode == "list":
             best_list_answer = None
             best_list_score = 0.0
@@ -523,6 +573,7 @@ class ProvenanceGraphRAG:
 
         for doc in context_docs:
             doc_source = str(doc.metadata.get("source", "")).lower()
+            provider = str(doc.metadata.get("provider", "")).lower()
             source_tokens = set(self._normalize_tokens(doc_source))
             doc_title_bias = 0.0
             if is_definition_query and focus_query:
@@ -557,8 +608,15 @@ class ProvenanceGraphRAG:
                     phrase_match = " ".join(query_tokens) in sentence_lower if len(query_tokens) >= 2 else False
                     lexical_overlap = len(query_tokens & set(self._normalize_tokens(sentence))) / max(len(query_tokens), 1)
                     looks_encyclopedic = lexical_overlap >= 0.6 and len(sentence.split()) <= 32
-                    if not (score >= 0.99 or phrase_match or (score >= 0.6 and has_definition_pattern) or looks_encyclopedic):
-                        continue
+                    # Для сторінок Wikipedia послаблюємо умови: достатньо
+                    # помірної відповідності та наявності шаблону визначення
+                    # або хоч якоїсь лексичної схожості.
+                    if provider == "wikipedia":
+                        if not (score >= 0.4 and (has_definition_pattern or lexical_overlap >= 0.4)):
+                            continue
+                    else:
+                        if not (score >= 0.99 or phrase_match or (score >= 0.6 and has_definition_pattern) or looks_encyclopedic):
+                            continue
                 if mode == "list" and not self._is_list_like_sentence(sentence):
                     continue
                 if score > best_score:
@@ -756,6 +814,15 @@ class ProvenanceGraphRAG:
             evidence = max(evidence, self._sentence_evidence_score(query, answer))
 
         quality = 0.45 * lexical + 0.55 * evidence
+
+        # Якщо відповідь пропускає суттєву частину ключових токенів запиту
+        # (наприклад, не містить слова "трансформер" у запиті про трансформер),
+        # вважаємо таку відповідь підозрілою і зменшуємо її якість.
+        if query_tokens:
+            missing = query_tokens - answer_tokens
+            missing_ratio = len(missing) / len(query_tokens)
+            if missing_ratio >= 0.4:
+                quality *= 0.4
         if mode == "definition":
             if len(answer.split()) < 4:
                 quality *= 0.3
@@ -1033,6 +1100,17 @@ class ProvenanceGraphRAG:
         return max(0.0, min(1.0, confidence))
 
     def _build_prompt_text(self, context: str, question: str) -> str:
+        if getattr(self.config, "llm_backend", "local") == "openai":
+            return (
+                "Ти помічник з питань штучного інтелекту та суміжних тем. "
+                "Тобі дається запит користувача та додатковий контекст (уривки з джерел). "
+                "Використовуй як свої загальні знання, так і цей контекст, щоб дати найкращу, коректну та стислену відповідь. "
+                "Якщо контекст суперечить твоїм знанням, надавай перевагу контексту. "
+                "Якщо ти справді не знаєш точної відповіді, чесно напиши, що не знаєш. "
+                "Відповідай лише українською мовою, чітко й по суті, без зайвих пояснень.\n\n"
+                f"Контекст (може бути неповним):\n{context}\n\n"
+                f"Питання користувача: {question}\n"
+            )
         SYS = chr(60) + "|system|" + chr(62)
         USR = chr(60) + "|user|" + chr(62)
         AST = chr(60) + "|assistant|" + chr(62)
@@ -1052,12 +1130,34 @@ class ProvenanceGraphRAG:
         if not context_docs:
             return "Недостатньо контексту для відповіді."
 
+        backend = getattr(self.config, "llm_backend", "local")
+
         extractive_answer = self._extractive_answer(query, context_docs)
         if extractive_answer:
-            return extractive_answer
+            # Якщо екстрактивна відповідь є одним із стандартних fallback-повідомлень
+            # про відсутність інформації, даємо шанс генеративній моделі
+            # (особливо для OpenAI-бекенду) спробувати побудувати відповідь
+            # на основі ширшого контексту.
+            fallback_answers = {
+                "Недостатньо контексту для відповіді.",
+                "У наданому контексті немає достатньо інформації для відповіді.",
+                "Не вдалося знайти коректне визначення у наданому контексті.",
+                "Не вдалося знайти прямий перелік або класифікацію у наданому контексті.",
+                "У наданому контексті немає достатньо прямої відповіді на це запитання.",
+                "У наданому контексті немає достатньо прямої відповіді на це фактологічне запитання.",
+            }
+            if backend != "openai" and extractive_answer not in fallback_answers:
+                # Для локальних моделей, як і раніше, можемо повертати хорошу
+                # екстрактивну відповідь напряму.
+                return extractive_answer
+            # Для OpenAI-бекенду завжди даємо шанс генеративній моделі, навіть
+            # якщо екстрактивний шар знайшов речення з високим score.
+            # Якщо екстрактивна відповідь була fallback-повідомленням, також
+            # продовжуємо до генеративного етапу.
 
         answer_evidence = self._compute_answer_evidence(query, context_docs)
-        if answer_evidence < 0.5:
+        backend = getattr(self.config, "llm_backend", "local")
+        if backend != "openai" and answer_evidence < 0.3:
             return "У наданому контексті немає достатньо інформації для відповіді."
 
         context_text = "\n\n".join(
@@ -1074,10 +1174,20 @@ class ProvenanceGraphRAG:
         if AST in response:
             response = response.split(AST)[-1].strip()
         response = response.strip()
-        latin_letters = sum(1 for char in response if "a" <= char.lower() <= "z")
-        cyrillic_letters = sum(1 for char in response if "а" <= char.lower() <= "я" or char.lower() == "є" or char.lower() == "і" or char.lower() == "ї" or char.lower() == "ґ")
-        if latin_letters > cyrillic_letters:
-            return "У наданому контексті немає достатньо інформації для відповіді."
+
+        # Фільтр латиниця/кирилиця залишаємо лише для локальних моделей,
+        # щоб захищатися від англомовних відповідей TinyLlama тощо.
+        backend = getattr(self.config, "llm_backend", "local")
+        if backend != "openai":
+            latin_letters = sum(1 for char in response if "a" <= char.lower() <= "z")
+            cyrillic_letters = sum(
+                1
+                for char in response
+                if "а" <= char.lower() <= "я" or char.lower() in {"є", "і", "ї", "ґ"}
+            )
+            if latin_letters > cyrillic_letters:
+                return "У наданому контексті немає достатньо інформації для відповіді."
+
         return response
 
     def get_subgraph_for_visualization(self, active_node_ids: List[str]) -> nx.Graph:
