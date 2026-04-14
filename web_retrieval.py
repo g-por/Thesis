@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import List
 from urllib.parse import quote_plus
 import html
+import os
 import re
 import xml.etree.ElementTree as ET
 
@@ -73,6 +74,67 @@ class WebSearchClient:
         if lowered.startswith("які") or lowered.startswith("які є") or lowered.startswith("яка класиф"):
             return "list"
         return "general"
+
+    @staticmethod
+    def _has_cyrillic(text: str) -> bool:
+        for ch in text:
+            if "а" <= ch <= "я" or "А" <= ch <= "Я" or ch in "їЇєЄіІґҐ":
+                return True
+        return False
+
+    def _translate_to_english(self, query: str) -> str:
+        """Перекладає запит українською на лаконічну англійську фразу для веб/академічного пошуку.
+
+        Якщо переклад неможливий (немає OPENAI_API_KEY або помилка мережі),
+        повертає початковий запит.
+        """
+        if not self._has_cyrillic(query):
+            return query
+
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            return query
+
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You translate user search queries from Ukrainian (or Russian) into "
+                        "concise English phrases suitable for academic and web search. "
+                        "Output only the English translation without explanations."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ],
+            "max_tokens": 64,
+            "temperature": 0.0,
+        }
+
+        try:
+            response = self.session.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = (
+                str(
+                    (data.get("choices") or [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+                .strip()
+            )
+            return text or query
+        except Exception:
+            return query
 
     def _query_focus(self, query: str) -> str:
         lowered = self._expand_query(query).lower().strip()
@@ -191,19 +253,18 @@ class WebSearchClient:
                 continue
             if mode == "list" and score < 0.35:
                 continue
-            if mode in {"definition", "factoid"} and top_encyclopedic_exists and item.provider.lower() in {"openalex", "arxiv", "semantic scholar"} and score < 0.8:
-                continue
+            # Не відсікаємо агресивно академічні джерела, навіть якщо є сильні
+            # енциклопедичні результати. Це дозволяє будувати більш насичені графи.
             item.score = max(0.0, min(1.0, score))
             filtered.append(item)
 
         if mode in {"definition", "factoid"} and filtered:
             encyclopedic = [item for item in filtered if item.provider.lower() in {"wikipedia", "duckduckgo"}]
             academic = [item for item in filtered if item.provider.lower() not in {"wikipedia", "duckduckgo"}]
-            prioritized = encyclopedic[:5]
-            if not prioritized:
-                prioritized = academic[:3]
-            else:
-                prioritized.extend(academic[:2])
+            prioritized: List[WebSearchResult] = []
+            prioritized.extend(encyclopedic[:3])
+            # Додаємо до трьох найкращих академічних результатів, якщо вони є
+            prioritized.extend(academic[:3])
             return prioritized
 
         if filtered:
@@ -212,6 +273,140 @@ class WebSearchClient:
             item.score = max(0.0, min(1.0, score))
             filtered.append(item)
         return filtered
+
+    def search_bing(self, query: str, limit: int = 3) -> List[WebSearchResult]:
+        # 1) Якщо налаштовано SERPAPI_API_KEY, використовуємо SerpAPI як проксі до Bing.
+        serp_key = os.environ.get("SERPAPI_API_KEY")
+        if serp_key:
+            try:
+                print(f"[BING_SERPAPI] Using SerpAPI Bing engine for query='{query}', limit={limit}")
+                response = self.session.get(
+                    "https://serpapi.com/search.json",
+                    params={
+                        "engine": "bing",
+                        "q": query,
+                        "api_key": serp_key,
+                        "num": limit,
+                    },
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                print(f"[BING_SERPAPI] Request failed: {exc}")
+            else:
+                try:
+                    payload = response.json()
+                except Exception as exc:
+                    print(f"[BING_SERPAPI] Failed to parse JSON response: {exc}")
+                else:
+                    organic = payload.get("organic_results") or []
+                    results: List[WebSearchResult] = []
+                    for idx, item in enumerate(organic[:limit]):
+                        title = self._normalize_spaces(item.get("title", ""))
+                        snippet_raw = (
+                            item.get("snippet")
+                            or " ".join(item.get("snippet_highlighted_words", [])).
+                            strip()
+                        )
+                        snippet = self._normalize_spaces(snippet_raw or "")
+                        url = item.get("link") or item.get("url", "") or ""
+                        if not title or not url:
+                            continue
+                        score = max(0.0, 0.9 - idx * 0.08)
+                        results.append(
+                            WebSearchResult("Bing", title, snippet[:800], url, score)
+                        )
+                    if results:
+                        return results
+
+        # 2) Fallback: офіційний Bing Search v7 через BING_SEARCH_API_KEY.
+        api_key = os.environ.get("BING_SEARCH_API_KEY")
+        if not api_key:
+            print("[BING] Neither SERPAPI_API_KEY nor BING_SEARCH_API_KEY is set; skipping Bing search")
+            return []
+
+        endpoint = os.environ.get(
+            "BING_SEARCH_ENDPOINT",
+            "https://api.bing.microsoft.com/v7.0/search",
+        )
+        try:
+            print(f"[BING] Sending request to {endpoint} with query='{query}' and limit={limit}")
+            response = self.session.get(
+                endpoint,
+                params={
+                    "q": query,
+                    "mkt": "uk-UA",
+                    "count": limit,
+                    "responseFilter": "Webpages",
+                },
+                headers={"Ocp-Apim-Subscription-Key": api_key},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            print(f"[BING] Request failed: {exc}")
+            return []
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            print(f"[BING] Failed to parse JSON response: {exc}")
+            return []
+
+        web_pages = (payload.get("webPages") or {}).get("value", [])
+        results: List[WebSearchResult] = []
+        for idx, item in enumerate(web_pages[:limit]):
+            title = self._normalize_spaces(item.get("name", ""))
+            snippet = self._normalize_spaces(item.get("snippet", ""))
+            url = item.get("url", "") or ""
+            if not title or not url:
+                continue
+            score = max(0.0, 0.9 - idx * 0.08)
+            results.append(
+                WebSearchResult("Bing", title, snippet[:800], url, score)
+            )
+        return results
+
+    def search_google(self, query: str, limit: int = 3) -> List[WebSearchResult]:
+        serp_key = os.environ.get("SERPAPI_API_KEY")
+        if not serp_key:
+            print("[GOOGLE_SERPAPI] SERPAPI_API_KEY is not set; skipping Google search")
+            return []
+
+        try:
+            print(f"[GOOGLE_SERPAPI] Using SerpAPI Google engine for query='{query}', limit={limit}")
+            response = self.session.get(
+                "https://serpapi.com/search.json",
+                params={
+                    "engine": "google",
+                    "q": query,
+                    "api_key": serp_key,
+                    "num": limit,
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            print(f"[GOOGLE_SERPAPI] Request failed: {exc}")
+            return []
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            print(f"[GOOGLE_SERPAPI] Failed to parse JSON response: {exc}")
+            return []
+
+        organic = payload.get("organic_results") or []
+        results: List[WebSearchResult] = []
+        for idx, item in enumerate(organic[:limit]):
+            title = self._normalize_spaces(item.get("title", ""))
+            snippet = self._normalize_spaces(item.get("snippet", ""))
+            url = item.get("link") or item.get("url", "") or ""
+            if not title or not url:
+                continue
+            score = max(0.0, 0.9 - idx * 0.08)
+            results.append(WebSearchResult("Google", title, snippet[:800], url, score))
+        return results
 
     def _safe_get_json(self, url: str, params: dict | None = None) -> dict | list | None:
         try:
@@ -378,43 +573,58 @@ class WebSearchClient:
         return results
 
     def search_duckduckgo(self, query: str, limit: int = 3) -> List[WebSearchResult]:
-        query = self._expand_query(query)
-        payload = self._safe_get_json(
-            "https://api.duckduckgo.com/",
-            params={
-                "q": query,
-                "format": "json",
-                "no_html": 1,
-                "skip_disambig": 1,
-            },
-        )
-        if not isinstance(payload, dict):
-            return []
+        original_query = query
         results: List[WebSearchResult] = []
-        abstract = self._normalize_spaces(payload.get("AbstractText", ""))
-        heading = self._normalize_spaces(payload.get("Heading", "")) or query
-        abstract_url = payload.get("AbstractURL", "") or ""
-        if abstract:
-            results.append(WebSearchResult("DuckDuckGo", heading, abstract, abstract_url, 0.82))
-        related = payload.get("RelatedTopics", [])
-        for item in related:
-            if len(results) >= limit:
-                break
-            if "Text" in item:
-                text = self._normalize_spaces(item.get("Text", ""))
-                url = item.get("FirstURL", "") or ""
-                title = text.split(" - ", 1)[0] if " - " in text else heading
-                if text:
-                    results.append(WebSearchResult("DuckDuckGo", title, text, url, max(0.0, 0.76 - 0.08 * len(results))))
-            elif "Topics" in item:
-                for nested in item.get("Topics", []):
-                    if len(results) >= limit:
-                        break
-                    text = self._normalize_spaces(nested.get("Text", ""))
-                    url = nested.get("FirstURL", "") or ""
+
+        for attempt in range(2):
+            if attempt == 0:
+                effective_query = self._expand_query(original_query)
+            else:
+                effective_query = self._translate_to_english(original_query)
+                if not effective_query or effective_query == original_query:
+                    break
+            print(f"[DDG] Calling DuckDuckGo for query='{effective_query}', limit={limit}, attempt={attempt}")
+            payload = self._safe_get_json(
+                "https://api.duckduckgo.com/",
+                params={
+                    "q": effective_query,
+                    "format": "json",
+                    "no_html": 1,
+                    "skip_disambig": 1,
+                },
+            )
+            if not isinstance(payload, dict):
+                print("[DDG] Response is not a dict or request failed")
+                continue
+            abstract = self._normalize_spaces(payload.get("AbstractText", ""))
+            related = payload.get("RelatedTopics", [])
+            print(f"[DDG] Abstract length={len(abstract)}, related_topics={len(related)}")
+            if not abstract and not related:
+                continue
+            heading = self._normalize_spaces(payload.get("Heading", "")) or effective_query
+            abstract_url = payload.get("AbstractURL", "") or ""
+            if abstract:
+                results.append(WebSearchResult("DuckDuckGo", heading, abstract, abstract_url, 0.82))
+            for item in related:
+                if len(results) >= limit:
+                    break
+                if "Text" in item:
+                    text = self._normalize_spaces(item.get("Text", ""))
+                    url = item.get("FirstURL", "") or ""
                     title = text.split(" - ", 1)[0] if " - " in text else heading
                     if text:
                         results.append(WebSearchResult("DuckDuckGo", title, text, url, max(0.0, 0.76 - 0.08 * len(results))))
+                elif "Topics" in item:
+                    for nested in item.get("Topics", []):
+                        if len(results) >= limit:
+                            break
+                        text = self._normalize_spaces(nested.get("Text", ""))
+                        url = nested.get("FirstURL", "") or ""
+                        title = text.split(" - ", 1)[0] if " - " in text else heading
+                        if text:
+                            results.append(WebSearchResult("DuckDuckGo", title, text, url, max(0.0, 0.76 - 0.08 * len(results))))
+            break
+
         return results[:limit]
 
     def search_provider(self, provider: str, query: str, limit: int = 3) -> List[WebSearchResult]:
@@ -429,16 +639,36 @@ class WebSearchClient:
             return self.search_semantic_scholar(query, limit=limit)
         if normalized == "duckduckgo":
             return self.search_duckduckgo(query, limit=limit)
+        if normalized in {"bing", "bing web", "bing search"}:
+            return self.search_bing(query, limit=limit)
+        if normalized in {"google", "google (serpapi)", "google serpapi"}:
+            return self.search_google(query, limit=limit)
         return []
 
     def search_many(self, query: str, providers: List[str], limit_per_provider: int = 3) -> List[WebSearchResult]:
         combined: List[WebSearchResult] = []
         seen = set()
+
+        # Розширена версія запиту українською (синоніми для AI/LLM тощо)
+        query_expanded = self._expand_query(query)
+        # Англомовний запит для академічних/Bing-провайдерів
+        query_english = self._translate_to_english(query)
+
         for provider in providers:
-            for item in self.search_provider(provider, query, limit=limit_per_provider):
+            normalized = provider.lower()
+            if normalized in {"openalex", "arxiv", "semantic scholar", "bing", "bing web", "bing search", "google", "google (serpapi)", "google serpapi"}:
+                effective_query = query_english
+            else:
+                effective_query = query_expanded
+
+            for item in self.search_provider(provider, effective_query, limit=limit_per_provider):
                 key = (item.provider, item.title, item.url)
                 if key in seen:
                     continue
                 seen.add(key)
                 combined.append(item)
-        return self._filter_and_rank_results(query, combined)
+        # Повертаємо об'єднаний список без додаткового агресивного фільтрування,
+        # щоб зберігати результати з усіх вибраних провайдерів. Окремі API вже
+        # повертають результати з власними score, які використовуються далі як
+        # vector_scores у RAG.
+        return combined

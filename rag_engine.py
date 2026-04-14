@@ -1091,10 +1091,22 @@ class ProvenanceGraphRAG:
             )
 
         confidence = sum(factor["contribution"] for factor in factors)
-        if f8 < 0.35:
-            confidence = min(confidence, 0.34)
-        elif f8 < 0.5:
-            confidence = min(confidence, 0.49)
+
+        # Для локальних/одномовних сценаріїв зберігаємо жорстке обрізання
+        # довіри за низького answer_evidence. Для веб-режиму з OpenAI, де
+        # запит може бути українською, а джерела англійською, лексична
+        # схожість між запитом і реченнями знижується, тому evidence може
+        # бути штучно низьким. У такому випадку не обрізаємо довіру так
+        # агресивно й покладаємося більше на якість відповіді.
+        backend = getattr(self.config, "llm_backend", "local")
+        providers = {str(doc.metadata.get("provider", "")).lower() for doc in result.context_docs}
+        is_web_mixed = any(p in {"wikipedia", "openalex", "arxiv", "semantic scholar", "duckduckgo", "bing"} for p in providers)
+
+        if not (backend == "openai" and is_web_mixed):
+            if f8 < 0.35:
+                confidence = min(confidence, 0.34)
+            elif f8 < 0.5:
+                confidence = min(confidence, 0.49)
         result.confidence_factors = factors
         result.confidence_band = self._confidence_band(confidence)
         return max(0.0, min(1.0, confidence))
@@ -1104,7 +1116,7 @@ class ProvenanceGraphRAG:
             return (
                 "Ти помічник з питань штучного інтелекту та суміжних тем. "
                 "Тобі дається запит користувача та додатковий контекст (уривки з джерел). "
-                "Використовуй як свої загальні знання, так і цей контекст, щоб дати найкращу, коректну та стислену відповідь. "
+                "Використовуй як свої загальні знання, так і цей контекст, щоб дати найкращу, коректну та стислу відповідь. "
                 "Якщо контекст суперечить твоїм знанням, надавай перевагу контексту. "
                 "Якщо ти справді не знаєш точної відповіді, чесно напиши, що не знаєш. "
                 "Відповідай лише українською мовою, чітко й по суті, без зайвих пояснень.\n\n"
@@ -1135,7 +1147,7 @@ class ProvenanceGraphRAG:
         extractive_answer = self._extractive_answer(query, context_docs)
         if extractive_answer:
             # Якщо екстрактивна відповідь є одним із стандартних fallback-повідомлень
-            # про відсутність інформації, даємо шанс генеративній моделі
+            # про відсутність інформації, даю шанс генеративній моделі
             # (особливо для OpenAI-бекенду) спробувати побудувати відповідь
             # на основі ширшого контексту.
             fallback_answers = {
@@ -1147,10 +1159,10 @@ class ProvenanceGraphRAG:
                 "У наданому контексті немає достатньо прямої відповіді на це фактологічне запитання.",
             }
             if backend != "openai" and extractive_answer not in fallback_answers:
-                # Для локальних моделей, як і раніше, можемо повертати хорошу
+                # Для локальних моделей, як і раніше, можу повертати хорошу
                 # екстрактивну відповідь напряму.
                 return extractive_answer
-            # Для OpenAI-бекенду завжди даємо шанс генеративній моделі, навіть
+            # Для OpenAI-бекенду завжди даю шанс генеративній моделі, навіть
             # якщо екстрактивний шар знайшов речення з високим score.
             # Якщо екстрактивна відповідь була fallback-повідомленням, також
             # продовжуємо до генеративного етапу.

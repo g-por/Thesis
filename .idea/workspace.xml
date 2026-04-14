@@ -4,10 +4,11 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="f1f29fc5-595f-40bc-b19e-b19bcc9a5326" name="Changes" comment="added experiments">
+    <list default="true" id="f1f29fc5-595f-40bc-b19e-b19bcc9a5326" name="Changes" comment="added OpenAI (gpt-4o-mini) like a model for answer generation">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/app.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/rag_engine.py" beforeDir="false" afterPath="$PROJECT_DIR$/rag_engine.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/web_retrieval.py" beforeDir="false" afterPath="$PROJECT_DIR$/web_retrieval.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -40,14 +41,44 @@
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
     "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.app.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
     "RunOnceActivity.git.unshallow": "true",
     "git-widget-placeholder": "master",
     "last_opened_file_path": "C:/Users/aleks/PycharmProjects/Thesis",
-    "settings.editor.selected.configurable": "DotEnv.SettingsForm"
+    "settings.editor.selected.configurable": "configurable.group.tools"
   }
 }]]></component>
+  <component name="RunManager">
+    <configuration name="app" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="Thesis" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/app.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <recent_temporary>
+      <list>
+        <item itemvalue="Python.app" />
+      </list>
+    </recent_temporary>
+  </component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
@@ -87,13 +118,22 @@
       <option name="project" value="LOCAL" />
       <updated>1775751758703</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="added OpenAI (gpt-4o-mini) like a model for answer generation">
+      <option name="closed" value="true" />
+      <created>1775756391959</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1775756391959</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="First coomit" />
     <MESSAGE value="added experiments" />
-    <option name="LAST_COMMIT_MESSAGE" value="added experiments" />
+    <MESSAGE value="added OpenAI (gpt-4o-mini) like a model for answer generation" />
+    <option name="LAST_COMMIT_MESSAGE" value="added OpenAI (gpt-4o-mini) like a model for answer generation" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>

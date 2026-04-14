@@ -11,7 +11,14 @@ from docx import Document as DocxDocument
 from rag_engine import ProvenanceGraphRAG, RetrievalResult, RAGConfig
 from web_retrieval import WebSearchClient
 
-st.set_page_config(page_title="Provenance Graph RAG", layout="wide")
+st.set_page_config(page_title="Provenance Graph RAG", page_icon="⚛️", layout="wide")
+
+HIDE_STATUS_CSS = """
+<style>
+[data-testid="stStatusWidget"] {display: none;}
+</style>
+"""
+st.markdown(HIDE_STATUS_CSS, unsafe_allow_html=True)
 
 if "rag_engine" not in st.session_state:
     st.session_state.rag_engine = None
@@ -20,7 +27,121 @@ if "processed" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-WEB_PROVIDER_OPTIONS = ["Wikipedia", "OpenAlex", "arXiv", "Semantic Scholar", "DuckDuckGo"]
+WEB_PROVIDER_OPTIONS = [
+    "Wikipedia",
+    "OpenAlex",
+    "arXiv",
+    "Semantic Scholar",
+    "Bing",
+    "Google",
+    "DuckDuckGo",
+]
+
+
+AI_LOADER_CSS = """
+<style>
+.ai-loader {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding-top: 0.5rem;
+  padding-bottom: 0.25rem;
+}
+
+.ai-loader-orbit {
+  position: relative;
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  border: 1px solid rgba(173, 216, 230, 0.5);
+  box-shadow: 0 0 18px rgba(102, 252, 241, 0.4);
+}
+
+.ai-loader-core {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 18px;
+  height: 18px;
+  margin-top: -9px;
+  margin-left: -9px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, #ffffff 0%, #66fcf1 45%, #0b0c10 100%);
+  box-shadow: 0 0 22px rgba(102, 252, 241, 0.8);
+}
+
+.ai-electron {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #45aaf2;
+  box-shadow: 0 0 12px rgba(69, 170, 242, 0.9);
+}
+
+.ai-electron:nth-child(2) {
+  top: -3px;
+  left: 50%;
+  margin-left: -5px;
+  animation: ai-orbit-1 3.4s linear infinite;
+}
+
+.ai-electron:nth-child(3) {
+  right: -3px;
+  top: 50%;
+  margin-top: -5px;
+  animation: ai-orbit-2 2.6s linear infinite;
+}
+
+.ai-electron:nth-child(4) {
+  bottom: -3px;
+  left: 50%;
+  margin-left: -5px;
+  animation: ai-orbit-3 4s linear infinite;
+}
+
+@keyframes ai-orbit-1 {
+  0% { transform: rotate(0deg) translateX(0); }
+  100% { transform: rotate(360deg) translateX(0); }
+}
+
+@keyframes ai-orbit-2 {
+  0% { transform: rotate(0deg) translateX(0); }
+  100% { transform: rotate(-360deg) translateX(0); }
+}
+
+@keyframes ai-orbit-3 {
+  0% { transform: rotate(0deg) translateX(0); }
+  100% { transform: rotate(360deg) translateX(0); }
+}
+
+.ai-loader-text {
+  margin-top: 0.4rem;
+  font-size: 0.9rem;
+  color: #cfd9df;
+}
+</style>
+"""
+
+
+def render_ai_loader(message: str, placeholder=None) -> None:
+    target = placeholder or st
+    target.markdown(AI_LOADER_CSS, unsafe_allow_html=True)
+    target.markdown(
+        f"""
+<div class="ai-loader">
+  <div class="ai-loader-orbit">
+    <div class="ai-loader-core"></div>
+    <div class="ai-electron"></div>
+    <div class="ai-electron"></div>
+    <div class="ai-electron"></div>
+  </div>
+  <div class="ai-loader-text">{message}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 def load_builtin_corpus() -> tuple[list[str], list[dict]]:
@@ -157,8 +278,9 @@ def build_web_result(engine: ProvenanceGraphRAG, query: str, providers: list[str
     for idx, doc in enumerate(docs):
         doc.metadata["chunk_id"] = f"web_{idx}"
     scores = [item.score for item in web_results]
-    docs, scores = engine._deduplicate_docs(docs, scores)
-    docs, scores = engine._trim_context(docs, scores)
+    # Для веб-режиму не обрізаємо результати до max_context_docs:
+    # беремо всі документи, які повернув search_many, тобто до
+    # limit_per_provider результатів з кожного обраного провайдера.
     result.context_docs = docs
     result.vector_scores = scores
     for doc, score in zip(result.context_docs, result.vector_scores):
@@ -289,7 +411,7 @@ with st.sidebar:
     selected_web_providers = st.multiselect(
         "Веб-провайдери",
         WEB_PROVIDER_OPTIONS,
-        default=["Wikipedia", "DuckDuckGo"],
+        default=WEB_PROVIDER_OPTIONS,
     )
     web_limit = st.slider("Результатів з кожного веб-провайдера", 1, 5, 2)
 
@@ -308,43 +430,47 @@ with st.sidebar:
         elif search_mode in {"Веб", "Локальні файли + Веб"} and not selected_web_providers:
             st.warning("Оберіть хоча б один веб-провайдер.")
         else:
-            with st.spinner("Завантаження моделі та підготовка джерел..."):
-                try:
-                    texts = []
-                    metadatas = []
+            loader_placeholder = st.empty()
+            render_ai_loader("Завантаження моделі та побудова графа знань...", placeholder=loader_placeholder)
+            try:
+                texts = []
+                metadatas = []
 
-                    for file in uploaded_files:
-                        text = read_uploaded_file(file)
-                        if not text.strip():
-                            continue
-                        texts.append(text)
-                        metadatas.append({"source": file.name})
+                for file in uploaded_files:
+                    text = read_uploaded_file(file)
+                    if not text.strip():
+                        continue
+                    texts.append(text)
+                    metadatas.append({"source": file.name})
 
-                    if use_builtin_corpus:
-                        builtin_texts, builtin_metadatas = load_builtin_corpus()
-                        texts.extend(builtin_texts)
-                        metadatas.extend(builtin_metadatas)
+                if use_builtin_corpus:
+                    builtin_texts, builtin_metadatas = load_builtin_corpus()
+                    texts.extend(builtin_texts)
+                    metadatas.extend(builtin_metadatas)
 
-                    if needs_local_corpus and not texts:
-                        st.warning("Не вдалося отримати текст із вибраних джерел.")
-                        st.stop()
+                if needs_local_corpus and not texts:
+                    loader_placeholder.empty()
+                    st.warning("Не вдалося отримати текст із вибраних джерел.")
+                    st.stop()
 
-                    engine = _create_engine(model_choice)
-                    if texts:
-                        engine.process_documents(texts, metadatas)
-                    st.session_state.rag_engine = engine
-                    st.session_state.processed = True
-                    st.session_state.chat_history = []
-                    if texts:
-                        st.success(
-                            f"Успішно оброблено {len(texts)} локальних джерел. "
-                            f"Граф: {len(engine.graph.nodes)} вузлів, "
-                            f"{len(engine.graph.edges)} зв'язків."
-                        )
-                    else:
-                        st.success("Локальну модель підготовлено для веб-пошуку та синтезу відповіді.")
-                except Exception as e:
-                    st.error(f"Помилка: {e}")
+                engine = _create_engine(model_choice)
+                if texts:
+                    engine.process_documents(texts, metadatas)
+                st.session_state.rag_engine = engine
+                st.session_state.processed = True
+                st.session_state.chat_history = []
+                loader_placeholder.empty()
+                if texts:
+                    st.success(
+                        f"Успішно оброблено {len(texts)} локальних джерел. "
+                        f"Граф: {len(engine.graph.nodes)} вузлів, "
+                        f"{len(engine.graph.edges)} зв'язків."
+                    )
+                else:
+                    st.success("Локальну модель підготовлено для веб-пошуку та синтезу відповіді.")
+            except Exception as e:
+                loader_placeholder.empty()
+                st.error(f"Помилка: {e}")
 
 # --- Main area ---
 tab_query, tab_compare = st.tabs(["Запит", "Порівняння: з графом vs без графа"])
@@ -367,52 +493,54 @@ with tab_query:
             elif search_mode in {"Веб", "Локальні файли + Веб"} and not selected_web_providers:
                 st.warning("Оберіть хоча б один веб-провайдер.")
             else:
-                with st.spinner("Пошук та генерація відповіді..."):
-                    engine = get_engine(model_choice)
-                    if search_mode == "Локальні файли":
-                        res = engine.retrieve_with_graph(user_query, k=k_retrieval, hop_limit=hop_limit)
-                        answer = build_answer(engine, user_query, res)
-                        engine.calibrate_confidence_with_answer(user_query, res, answer)
-                        retrieved_ids = [d.metadata["chunk_id"] for d in res.context_docs]
-                        st.session_state.chat_history.append({
-                            "query": user_query,
-                            "answer": answer,
-                            "result": res,
-                            "active_nodes": retrieved_ids,
-                            "search_mode": search_mode,
-                        })
-                    elif search_mode == "Веб":
-                        res = build_web_result(engine, user_query, selected_web_providers, web_limit)
-                        answer = build_answer(engine, user_query, res)
-                        engine.calibrate_confidence_with_answer(user_query, res, answer)
-                        retrieved_ids = [d.metadata["chunk_id"] for d in res.context_docs]
-                        st.session_state.chat_history.append({
-                            "query": user_query,
-                            "answer": answer,
-                            "result": res,
-                            "active_nodes": retrieved_ids,
-                            "search_mode": search_mode,
-                        })
-                    else:
-                        local_res = engine.retrieve_with_graph(user_query, k=k_retrieval, hop_limit=hop_limit)
-                        web_res = build_web_result(engine, user_query, selected_web_providers, web_limit)
-                        merged = merge_results(engine, user_query, local_res, web_res)
-                        local_answer = build_answer(engine, user_query, local_res)
-                        web_answer = build_answer(engine, user_query, web_res)
-                        engine.calibrate_confidence_with_answer(user_query, local_res, local_answer)
-                        engine.calibrate_confidence_with_answer(user_query, web_res, web_answer)
-                        merged.confidence_score = max(local_res.confidence_score, web_res.confidence_score)
-                        st.session_state.chat_history.append({
-                            "query": user_query,
-                            "answer": local_answer if local_res.confidence_score >= web_res.confidence_score else web_answer,
-                            "result": merged,
-                            "local_result": local_res,
-                            "web_result": web_res,
-                            "local_answer": local_answer,
-                            "web_answer": web_answer,
-                            "active_nodes": [d.metadata["chunk_id"] for d in local_res.context_docs],
-                            "search_mode": search_mode,
-                        })
+                loader_placeholder = st.empty()
+                render_ai_loader("Обхід векторного індексу та графа походження...", placeholder=loader_placeholder)
+                engine = get_engine(model_choice)
+                if search_mode == "Локальні файли":
+                    res = engine.retrieve_with_graph(user_query, k=k_retrieval, hop_limit=hop_limit)
+                    answer = build_answer(engine, user_query, res)
+                    engine.calibrate_confidence_with_answer(user_query, res, answer)
+                    retrieved_ids = [d.metadata["chunk_id"] for d in res.context_docs]
+                    st.session_state.chat_history.append({
+                        "query": user_query,
+                        "answer": answer,
+                        "result": res,
+                        "active_nodes": retrieved_ids,
+                        "search_mode": search_mode,
+                    })
+                elif search_mode == "Веб":
+                    res = build_web_result(engine, user_query, selected_web_providers, web_limit)
+                    answer = build_answer(engine, user_query, res)
+                    engine.calibrate_confidence_with_answer(user_query, res, answer)
+                    retrieved_ids = [d.metadata["chunk_id"] for d in res.context_docs]
+                    st.session_state.chat_history.append({
+                        "query": user_query,
+                        "answer": answer,
+                        "result": res,
+                        "active_nodes": retrieved_ids,
+                        "search_mode": search_mode,
+                    })
+                else:
+                    local_res = engine.retrieve_with_graph(user_query, k=k_retrieval, hop_limit=hop_limit)
+                    web_res = build_web_result(engine, user_query, selected_web_providers, web_limit)
+                    merged = merge_results(engine, user_query, local_res, web_res)
+                    local_answer = build_answer(engine, user_query, local_res)
+                    web_answer = build_answer(engine, user_query, web_res)
+                    engine.calibrate_confidence_with_answer(user_query, local_res, local_answer)
+                    engine.calibrate_confidence_with_answer(user_query, web_res, web_answer)
+                    merged.confidence_score = max(local_res.confidence_score, web_res.confidence_score)
+                    st.session_state.chat_history.append({
+                        "query": user_query,
+                        "answer": local_answer if local_res.confidence_score >= web_res.confidence_score else web_answer,
+                        "result": merged,
+                        "local_result": local_res,
+                        "web_result": web_res,
+                        "local_answer": local_answer,
+                        "web_answer": web_answer,
+                        "active_nodes": [d.metadata["chunk_id"] for d in local_res.context_docs],
+                        "search_mode": search_mode,
+                    })
+                loader_placeholder.empty()
 
         st.subheader("Історія")
         for chat in reversed(st.session_state.chat_history):
@@ -505,36 +633,38 @@ with tab_compare:
             if not cmp_query:
                 st.warning("Введіть запит.")
             else:
-                with st.spinner("Генерація двох відповідей..."):
-                    engine = st.session_state.rag_engine
-                    comp = engine.compare(cmp_query, k=cmp_k, hop_limit=cmp_hop)
+                loader_placeholder = st.empty()
+                render_ai_loader("Порівняння базового RAG та RAG з графом походження...", placeholder=loader_placeholder)
+                engine = st.session_state.rag_engine
+                comp = engine.compare(cmp_query, k=cmp_k, hop_limit=cmp_hop)
 
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("### З графом походження")
-                        st.success(comp.answer_with_graph)
-                        r = comp.with_graph
-                        m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("Confidence", f"{r.confidence_score:.3f}")
-                        m2.metric("Фрагментів", len(r.context_docs))
-                        m3.metric("Додано графом", r.graph_expanded_count)
-                        m4.metric("Джерел", r.unique_sources)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("### З графом походження")
+                    st.success(comp.answer_with_graph)
+                    r = comp.with_graph
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Confidence", f"{r.confidence_score:.3f}")
+                    m2.metric("Фрагментів", len(r.context_docs))
+                    m3.metric("Додано графом", r.graph_expanded_count)
+                    m4.metric("Джерел", r.unique_sources)
 
-                    with c2:
-                        st.markdown("### Без графа (baseline)")
-                        st.warning(comp.answer_without_graph)
-                        r2 = comp.without_graph
-                        m5, m6, m7, m8 = st.columns(4)
-                        m5.metric("Confidence", f"{r2.confidence_score:.3f}")
-                        m6.metric("Фрагментів", len(r2.context_docs))
-                        m7.metric("Додано графом", r2.graph_expanded_count)
-                        m8.metric("Джерел", r2.unique_sources)
+                with c2:
+                    st.markdown("### Без графа (baseline)")
+                    st.warning(comp.answer_without_graph)
+                    r2 = comp.without_graph
+                    m5, m6, m7, m8 = st.columns(4)
+                    m5.metric("Confidence", f"{r2.confidence_score:.3f}")
+                    m6.metric("Фрагментів", len(r2.context_docs))
+                    m7.metric("Додано графом", r2.graph_expanded_count)
+                    m8.metric("Джерел", r2.unique_sources)
 
-                    st.markdown("---")
-                    delta = comp.with_graph.confidence_score - comp.without_graph.confidence_score
-                    if delta > 0:
-                        st.success(f"Граф походження підвищив довіру на +{delta:.3f}")
-                    elif delta < 0:
-                        st.warning(f"Граф походження знизив довіру на {delta:.3f}")
-                    else:
-                        st.info("Рівень довіри однаковий.")
+                loader_placeholder.empty()
+                st.markdown("---")
+                delta = comp.with_graph.confidence_score - comp.without_graph.confidence_score
+                if delta > 0:
+                    st.success(f"Граф походження підвищив довіру на +{delta:.3f}")
+                elif delta < 0:
+                    st.warning(f"Граф походження знизив довіру на {delta:.3f}")
+                else:
+                    st.info("Рівень довіри однаковий.")
